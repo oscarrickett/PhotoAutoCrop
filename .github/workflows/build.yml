@@ -16,8 +16,6 @@ jobs:
             label: windows-x64
           - os: macos-latest    # Apple Silicon (M1/M2/M3/M4)
             label: macos-arm64
-          - os: macos-13        # Last Intel-Mac runner image
-            label: macos-x86_64
 
     runs-on: ${{ matrix.os }}
     name: Build (${{ matrix.label }})
