@@ -33,6 +33,9 @@
     $("#list-view").hidden = name !== "list";
     $("#editor-view").hidden = name !== "editor";
     $("#topbar").hidden = name === "folder";
+    // The review-progress bar belongs to the list view only. renderCounts
+    // will re-show it (if there are entries) the next time it runs.
+    if (name !== "list") $("#review-progress").hidden = true;
   }
 
   // ---------- Folder picker ----------
@@ -313,14 +316,18 @@
   function refreshCroppedImageOnly(entry) {
     // Update the manifest cache and just swap the "auto-cropped" <img>'s
     // src — leaves the "original + green guide" image alone so it doesn't
-    // re-fetch when only the cropped output changed (Auto Tone toggle,
-    // Highlights slider, etc.).
+    // re-fetch when only the cropped output changed (Auto Tone toggle, etc.).
     const idx = state.manifest.entries.findIndex((x) => x.filename === entry.filename);
     if (idx >= 0) state.manifest.entries[idx] = entry;
     const row = state.rowsByFilename.get(entry.filename);
     if (!row) return;
     const img = row.querySelector(".cell.cropped img");
     if (!img) return;
+    // Clear any leftover optimistic-spin transform from rotateRow so the
+    // new (server-rotated) image doesn't get an extra CSS rotation on top.
+    img.style.transition = "";
+    img.style.transform = "";
+    delete img.dataset.optimisticRot;
     const ts = entry.timestamp || "";
     img.src = `/api/output/${encodeURIComponent(entry.filename)}?t=${encodeURIComponent(ts)}&v=${Date.now()}`;
     img.removeAttribute("data-src");
@@ -514,9 +521,14 @@
     // Optimistic spin: rotate the existing thumbnail in the browser
     // right away so the click feels instant. The server's re-rendered
     // JPEG arrives a moment later and seamlessly replaces it.
+    //
+    // Note: we DON'T mod the angle to [0, 360). CSS `transform: rotate`
+    // animates between the literal previous and next values, so wrapping
+    // through 0° would make the image spin the long way round (e.g.
+    // 0° → 270° goes 3/4 turn clockwise instead of 1/4 turn left).
     if (img) {
-      const prev = parseInt(img.dataset.optimisticRot || "0", 10) || 0;
-      const next = (((prev + delta * 90) % 360) + 360) % 360;
+      const prev = parseFloat(img.dataset.optimisticRot || "0") || 0;
+      const next = prev + delta * 90;
       img.dataset.optimisticRot = String(next);
       img.style.transition = "transform 0.18s ease";
       img.style.transform = `rotate(${next}deg)`;
@@ -590,6 +602,34 @@
       toast(`Image failed to load: ${entry.filename}`, 4000);
     };
     img.src = `/api/image/${encodeURIComponent(entry.filename)}`;
+  }
+
+  function editorHasUnsavedEdits() {
+    if (!state.current || !state.konva) return false;
+    const slider = parseFloat($("#rotation-slider").value);
+    const savedRot = state.current.rotation_deg ?? 0;
+    if (Math.abs(slider - savedRot) > 0.01) return true;
+    const savedUp = (((state.current.upright_rotation_qt ?? 0) % 4) + 4) % 4;
+    const curUp = (((state.uprightQt || 0) % 4) + 4) % 4;
+    if (savedUp !== curUp) return true;
+    const crop = getCropBoxInImageCoords();
+    const saved = state.current.crop_box;
+    if (!crop || !saved) return !!crop !== !!saved;
+    if (Math.abs(crop.cx - saved.cx) > 0.5) return true;
+    if (Math.abs(crop.cy - saved.cy) > 0.5) return true;
+    if (Math.abs(crop.w - saved.w) > 0.5) return true;
+    if (Math.abs(crop.h - saved.h) > 0.5) return true;
+    return false;
+  }
+
+  async function closeEditorWithSave() {
+    if (editorHasUnsavedEdits()) {
+      // Persist the user's tweaks but keep the entry's existing decision so
+      // hitting Back doesn't promote a needs-review item to approved.
+      await saveDecision(state.current.decision || "needs-review");
+      return;
+    }
+    closeEditor();
   }
 
   function closeEditor() {
@@ -1058,7 +1098,7 @@
       }
     });
 
-    $("#btn-back").addEventListener("click", closeEditor);
+    $("#btn-back").addEventListener("click", closeEditorWithSave);
     $("#rotation-slider").addEventListener("input", updateRotationReadout);
     $("#btn-rotate-left").addEventListener("click", () => nudgeRotation(-0.5));
     $("#btn-rotate-right").addEventListener("click", () => nudgeRotation(0.5));
@@ -1093,7 +1133,7 @@
     document.addEventListener("keydown", (e) => {
       if ($("#editor-view").hidden) return;
       if (e.target.tagName === "INPUT") return;
-      if (e.key === "Escape") closeEditor();
+      if (e.key === "Escape") closeEditorWithSave();
       else if (e.key === "s" || e.key === "S") saveDecision("approved");
       else if (e.key === "Enter") saveDecision("approved");
       else if (e.key === "ArrowLeft") { nudgeRotation(e.shiftKey ? -0.1 : -0.5); e.preventDefault(); }

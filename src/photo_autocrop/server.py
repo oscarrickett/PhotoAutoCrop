@@ -137,10 +137,17 @@ def _bg_pipeline(folder: Path) -> None:
             _progress["total"] = total
             _progress["current"] = entry.filename
     try:
+        # Skip files that already have a manifest entry — detection is
+        # deterministic, so re-running it on every open would just burn
+        # CPU for the same result. Only newly-added JPGs are processed.
+        manifest = load_manifest(folder)
+        existing_names = {e.filename for e in manifest.entries}
         files = discover_inputs(folder)
+        new_files = [f for f in files if f.name not in existing_names]
         with _progress_lock:
-            _progress["total"] = len(files)
-        run_batch(folder, progress_callback=cb)
+            _progress["total"] = len(new_files)
+        if new_files:
+            run_batch(folder, progress_callback=cb, only_new=True)
     except Exception as exc:
         with _progress_lock:
             _progress["error"] = str(exc)
