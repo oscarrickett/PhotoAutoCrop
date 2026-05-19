@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PhotoAutoCrop</title>
+  <link rel="icon" type="image/png" href="/logo.png" />
+  <link rel="apple-touch-icon" href="/logo.png" />
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="/konva.min.js"></script>
+</head>
+<body>
+  <header id="topbar" hidden>
+    <div class="title">
+      <img class="logo-img" src="/logo.png" alt="Henley Scan" />
+      <span class="tool-name">Scan auto-finisher</span>
+      <span class="version" id="app-version"></span>
+    </div>
+    <div class="folder-info" id="folder-info" title="Current folder"></div>
+    <div class="counts" id="counts"></div>
+    <nav class="tabs" id="tabs">
+      <button data-filter="all">All</button>
+      <button data-filter="needs-review" class="active">Needs review</button>
+      <button data-filter="approved">Saved</button>
+    </nav>
+    <button id="btn-save-all" title="Mark every Needs review photo as Saved in one click">Save all</button>
+    <button id="btn-change-folder" title="Pick a different folder">Change folder</button>
+    <button id="btn-reprocess" title="Re-run auto-crop on files not yet user-edited">Reprocess</button>
+  </header>
+  <div id="review-progress" hidden title="Review progress">
+    <div id="review-progress-fill"></div>
+    <div id="review-progress-label"></div>
+  </div>
+
+  <section id="folder-view">
+    <div class="folder-picker">
+      <img class="logo-img" src="/logo.png" alt="Henley Scan" />
+      <h1>Scan auto-finisher</h1>
+      <p class="picker-sub">Paste the path to a folder of JPG scans. Each photo is detected against the mat, straightened, rotated upright (face detection), and grouped by print size so 4×6, 5×7, … prints all snap to consistent dimensions. Review and tweak side-by-side before saving.</p>
+      <input id="folder-path" type="text" spellcheck="false" placeholder="e.g. C:\Users\you\Pictures\Scans" />
+      <button id="btn-open-folder">Process folder</button>
+      <div id="folder-progress" hidden>
+        <div class="progress-line">
+          <div class="spinner"></div>
+          <div id="folder-progress-text">Starting…</div>
+        </div>
+        <div class="progress-bar"><div id="folder-progress-fill" class="progress-fill"></div></div>
+        <div id="folder-progress-current"></div>
+      </div>
+      <div id="folder-error" class="error" hidden></div>
+    </div>
+  </section>
+
+  <main id="list-view" hidden>
+    <div id="list"></div>
+  </main>
+
+  <section id="editor-view" hidden>
+    <header id="editor-bar">
+      <button id="btn-back">&larr; Back to list</button>
+      <div class="editor-filename" id="editor-filename"></div>
+      <div class="editor-shortcuts">
+        <kbd>S</kbd> save &nbsp; <kbd>Esc</kbd> cancel &nbsp;
+        <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> rotate &nbsp; <kbd>Shift</kbd> finer
+      </div>
+    </header>
+    <div id="editor-body">
+      <div id="canvas-wrap">
+        <div id="canvas-container"></div>
+      </div>
+      <aside id="editor-side">
+        <label class="ctl">
+          Rotation
+          <input type="range" id="rotation-slider" min="-45" max="45" step="0.1" value="0" />
+          <span id="rotation-readout">0.0&deg;</span>
+        </label>
+        <div class="ctl-buttons">
+          <button id="btn-rotate-left">&minus;0.5&deg;</button>
+          <button id="btn-rotate-right">+0.5&deg;</button>
+        </div>
+        <div class="ctl-buttons rotate-90" title="Rotate by 90° — applied to both the preview and the saved crop">
+          <button id="btn-upright-ccw" class="icon-btn" aria-label="Rotate 90° counter-clockwise" title="Rotate 90° counter-clockwise">
+            <svg viewBox="0 0 24 24" width="32" height="32" stroke="currentColor" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 12a9 9 0 1 0 3-6.7"/>
+              <polyline points="3 3 3 9 9 9"/>
+            </svg>
+          </button>
+          <button id="btn-upright-cw" class="icon-btn" aria-label="Rotate 90° clockwise" title="Rotate 90° clockwise">
+            <svg viewBox="0 0 24 24" width="32" height="32" stroke="currentColor" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12a9 9 0 1 1-3-6.7"/>
+              <polyline points="21 3 21 9 15 9"/>
+            </svg>
+          </button>
+        </div>
+        <div class="ctl-buttons">
+          <button id="btn-reset">Reset to auto</button>
+          <button id="btn-fit-frame">Fit to frame</button>
+        </div>
+        <div class="ctl-buttons">
+          <button id="btn-reset-rotation" title="Set rotation back to 0°">Reset rotation</button>
+        </div>
+        <hr />
+        <div class="ctl-buttons primary">
+          <button id="btn-approve" class="approve">Save (S)</button>
+        </div>
+        <p class="hint">Drag the crop rectangle's corners to resize, drag the body to move.</p>
+      </aside>
+    </div>
+  </section>
+
+  <script src="/app.js"></script>
+</body>
+</html>

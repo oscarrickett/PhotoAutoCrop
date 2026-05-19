@@ -1,0 +1,24 @@
+[project]
+name = "photo-autocrop"
+version = "0.4.0"
+description = "Auto-crop and straighten copy-stand photos, with an in-browser review pass."
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python>=4.9",
+    "numpy>=1.26",
+    "pillow>=10.2",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "typer>=0.12",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+photo-autocrop = "photo_autocrop.cli:app"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
