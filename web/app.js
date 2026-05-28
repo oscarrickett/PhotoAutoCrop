@@ -39,17 +39,23 @@
   }
 
   // ---------- Folder picker ----------
+  function selectedMethod() {
+    const r = document.querySelector("#folder-method input[name='method']:checked");
+    return r ? r.value : "auto";
+  }
+
   async function openFolder(path) {
     const errEl = $("#folder-error");
     errEl.hidden = true;
     $("#btn-open-folder").disabled = true;
     $("#folder-progress").hidden = false;
     setProgress({ running: true, total: 0, done: 0, current: "" });
+    const method = selectedMethod();
     try {
       const r = await fetch("/api/open-folder", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path }),
+        body: JSON.stringify({ path, method }),
       });
       if (!r.ok) {
         const j = await r.json().catch(() => ({ detail: r.statusText }));
@@ -1073,32 +1079,58 @@
 
     $("#btn-save-all").addEventListener("click", saveAll);
 
-    $("#btn-reprocess").addEventListener("click", async () => {
+    async function runReprocess(method) {
       const btn = $("#btn-reprocess");
+      const original = btn.textContent;
       btn.disabled = true;
-      btn.textContent = "Checking…";
+      btn.textContent = method === "slide" ? "Re-detecting…" : "Checking…";
       try {
-        const r = await fetch("/api/reprocess", { method: "POST" });
-        if (!r.ok) {
-          toast("Reprocess failed");
-          return;
-        }
+        const r = await fetch(`/api/reprocess?method=${encodeURIComponent(method)}`, { method: "POST" });
+        if (!r.ok) { toast("Reprocess failed"); return; }
         const j = await r.json();
         if (!j.processed) {
-          toast("No new files in this folder");
+          toast(method === "slide" ? "No files to re-detect" : "No new files in this folder");
           return;
         }
-        toast(`Added ${j.processed} new file${j.processed === 1 ? "" : "s"}`);
+        const noun = method === "slide" ? "re-detected" : "added";
+        toast(`${noun} ${j.processed} file${j.processed === 1 ? "" : "s"}`);
+        state.cacheBuster = Date.now();
         await fetchManifest();
         renderCounts();
         renderList();
       } finally {
         btn.disabled = false;
-        btn.textContent = "Reprocess";
+        btn.textContent = original;
       }
-    });
+    }
+
+    $("#btn-reprocess").addEventListener("click", () => runReprocess("auto"));
+
+    const menuBtn = $("#btn-reprocess-menu");
+    const menu = $("#reprocess-menu");
+    if (menuBtn && menu) {
+      menuBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        menu.hidden = !menu.hidden;
+      });
+      menu.addEventListener("click", (ev) => {
+        const b = ev.target.closest("button[data-method]");
+        if (!b) return;
+        menu.hidden = true;
+        runReprocess(b.dataset.method);
+      });
+      document.addEventListener("click", (ev) => {
+        if (!menu.hidden && !menu.contains(ev.target) && ev.target !== menuBtn) {
+          menu.hidden = true;
+        }
+      });
+    }
+
+    $("#btn-quit").addEventListener("click", quitApp);
 
     $("#btn-back").addEventListener("click", closeEditorWithSave);
+    const btnSlide = $("#btn-redetect-slide");
+    if (btnSlide) btnSlide.addEventListener("click", () => redetectAs("slide"));
     $("#rotation-slider").addEventListener("input", updateRotationReadout);
     $("#btn-rotate-left").addEventListener("click", () => nudgeRotation(-0.5));
     $("#btn-rotate-right").addEventListener("click", () => nudgeRotation(0.5));
@@ -1219,6 +1251,53 @@
       toast("Auto Tone toggle error");
     } finally {
       if (row) row.classList.remove("updating");
+    }
+  }
+
+  // ---------- Quit ----------
+  async function quitApp() {
+    if (!confirm("Quit PhotoAutoCrop?\n\nAny saved edits are already on disk. The browser tab will stay open but the app will stop responding.")) return;
+    try {
+      await fetch("/api/shutdown", { method: "POST" });
+    } catch (err) {
+      // Expected — the server kills itself before responding cleanly.
+    }
+    document.body.innerHTML = `
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:system-ui,sans-serif;color:#475569;text-align:center;padding:24px;">
+        <img src="/logo.png" alt="" style="height:64px;margin-bottom:18px;opacity:0.6;" onerror="this.style.display='none'" />
+        <h1 style="font-size:20px;margin:0 0 8px;color:#0f172a;">PhotoAutoCrop has quit</h1>
+        <p style="margin:0;">You can close this tab.</p>
+      </div>
+    `;
+  }
+
+  // ---------- Re-detect a single photo from the editor ----------
+  async function redetectAs(method) {
+    if (!state.current) return;
+    const btn = $("#btn-redetect-slide");
+    const original = btn ? btn.textContent : null;
+    if (btn) { btn.disabled = true; btn.textContent = "Detecting…"; }
+    try {
+      const r = await fetch("/api/redetect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: state.current.filename, method }),
+      });
+      if (!r.ok) { toast("Re-detect failed"); return; }
+      const j = await r.json();
+      state.current = j.entry;
+      // Reload the image (preview path may have changed underneath) and rebuild the canvas.
+      const img = new Image();
+      img.onload = () => {
+        state.imageEl = img;
+        setupKonva();
+      };
+      img.src = `/api/image/${encodeURIComponent(state.current.filename)}?v=${Date.now()}`;
+      await fetchManifest();
+      state.cacheBuster = Date.now();
+      toast(`Re-detected as ${method}`);
+    } finally {
+      if (btn && original !== null) { btn.disabled = false; btn.textContent = original; }
     }
   }
 

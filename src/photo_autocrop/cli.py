@@ -39,6 +39,18 @@ def run(
             print(f"  {k:<13} {counts[k]}")
 
 
+def _wait_for_port(host: str, port: int, timeout: float = 15.0) -> bool:
+    import socket as _socket
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with _socket.create_connection((host, port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
 @app.command()
 def review(
     folder: Path = typer.Argument(None, file_okay=False, dir_okay=True, help="Folder to review. Omit to pick one in the browser."),
@@ -49,6 +61,8 @@ def review(
     """Launch the in-browser review UI. If no folder is provided, the
     browser opens a folder-picker first.
     """
+    import threading
+
     import uvicorn
 
     from . import server
@@ -56,13 +70,26 @@ def review(
     if folder is not None:
         server.set_input_folder(folder.resolve())
     url = f"http://{host}:{port}"
+    print(f"Review server: {url}", flush=True)
+
+    config = uvicorn.Config(server.app, host=host, port=port, log_level="warning")
+    uv_server = uvicorn.Server(config)
+    server_thread = threading.Thread(target=uv_server.run, daemon=True)
+    server_thread.start()
+
     if not no_browser:
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
-    print(f"Review server: {url}")
-    uvicorn.run(server.app, host=host, port=port, log_level="warning")
+        if _wait_for_port(host, port):
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+    try:
+        while server_thread.is_alive():
+            server_thread.join(timeout=1.0)
+    except KeyboardInterrupt:
+        uv_server.should_exit = True
+        server_thread.join(timeout=2.0)
 
 
 @app.command()

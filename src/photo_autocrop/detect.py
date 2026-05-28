@@ -159,7 +159,46 @@ def _photo_mask_edges(small_bgr: np.ndarray) -> np.ndarray:
     return filled
 
 
-METHODS = ("auto", "small", "loose", "edges")
+def _photo_mask_slide(small_bgr: np.ndarray) -> np.ndarray:
+    """For scanned slides: bright image rectangle in a dark mount surround.
+
+    1. Estimate the mount luminance level from the 15th-percentile of L
+       (the mount typically covers >15% of the slide).
+    2. Mark every pixel brighter than mount+margin as candidate photo.
+    3. Close small holes (interior dark scene content), then OPEN with
+       an 11px ellipse — this removes the thin (1-5 px) scanner
+       reflection ring that fooled GrabCut while leaving the large
+       photo blob intact.
+    4. Returns an empty mask if mount level is too bright (not a slide),
+       so the caller falls through to another method.
+    """
+    h, w = small_bgr.shape[:2]
+    lab = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2LAB)
+    L = lab[:, :, 0]
+    mount_level = float(np.percentile(L, 15))
+    # Mount must actually be dark — bail on light backgrounds (grey mat).
+    if mount_level > 50:
+        return np.zeros((h, w), np.uint8)
+    # Threshold well above mount level so we skip the soft transition
+    # band at the photo's true edge (anti-aliased film/scanner boundary
+    # that the user sees as a "faint line" around the real photo).
+    above = (L > mount_level + 20).astype(np.uint8) * 255
+    # Need a meaningful amount of "above-mount" pixels.
+    if above.sum() // 255 < 0.05 * h * w:
+        return np.zeros((h, w), np.uint8)
+    # Fill small interior holes (dark photo content).
+    above = cv2.morphologyEx(
+        above, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    )
+    # Kill the thin scanner-reflection ring (3-5 px wide) without
+    # eroding the photo blob too much.
+    above = cv2.morphologyEx(
+        above, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    )
+    return above
+
+
+METHODS = ("auto", "small", "loose", "edges", "slide")
 
 
 def _photo_mask(small_bgr: np.ndarray, method: str = "auto") -> np.ndarray:
@@ -169,6 +208,8 @@ def _photo_mask(small_bgr: np.ndarray, method: str = "auto") -> np.ndarray:
         return _photo_mask_loose(small_bgr)
     if method == "edges":
         return _photo_mask_edges(small_bgr)
+    if method == "slide":
+        return _photo_mask_slide(small_bgr)
     return _photo_mask_auto(small_bgr)
 
 

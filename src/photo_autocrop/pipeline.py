@@ -24,7 +24,7 @@ from .auto_tone import auto_tone
 from .orient import detect_upright_quarter_turns
 from .schemas import CropBoxModel, Manifest, ManifestEntry
 from .score import score_detection
-from .straighten import apply_quarter_turns, straighten_and_crop
+from .straighten import apply_quarter_turns, shrink_for_method, straighten_and_crop
 
 
 BUCKETS = ("approved", "needs-review", "rejected")  # manifest decision enum
@@ -184,6 +184,11 @@ def _process_one(args: tuple[str, str]) -> dict:
     src = Path(src_str)
     input_folder = Path(input_folder_str)
     timestamp = _now_iso()
+    # Detection results change → the cached "original with green guide"
+    # PNGs are stale (their cache key is per-corner-coords, so a new file
+    # would be written anyway, but pruning keeps the cache from growing
+    # without bound across reprocess runs).
+    _prune_with_guide_cache(input_folder, src.name)
     try:
         loaded = load_image(src)
     except Exception as exc:
@@ -256,7 +261,7 @@ def _process_one(args: tuple[str, str]) -> dict:
         small_bgr = loaded.bgr
 
     score = score_detection(detection, small_bgr)
-    result = straighten_and_crop(loaded.bgr, detection)
+    result = straighten_and_crop(loaded.bgr, detection, shrink=shrink_for_method(method))
     if result is None:
         remove_cropped_if_present(input_folder, src.name)
         return {
@@ -405,6 +410,80 @@ def apply_size_to_entry(
     return entry
 
 
+def unify_slide_crops(input_folder: Path) -> int:
+    """Snap every slide-method entry to the median rect across all such
+    entries. Slides come off the same scanner at a consistent physical
+    position, so per-photo detection jitter is noise — averaging it out
+    gives identical crops across the whole batch.
+
+    Re-renders every affected entry's preview/thumb/cropped output.
+    Returns the number of entries unified.
+    """
+    from .straighten import CropBox, apply_user_edit
+
+    input_folder = input_folder.resolve()
+    manifest = load_manifest(input_folder)
+    candidates = [
+        e for e in manifest.entries
+        if e.detection_method == "slide"
+        and e.crop_box is not None
+        and e.rotation_deg is not None
+    ]
+    if len(candidates) < 2:
+        return 0
+
+    # Normalise each rect to (long, short) so portrait/landscape entries
+    # vote into the same median bucket. Median is taken on long/short
+    # instead of w/h to keep portrait slides from dragging w down.
+    longs = [max(e.crop_box.w, e.crop_box.h) for e in candidates]
+    shorts = [min(e.crop_box.w, e.crop_box.h) for e in candidates]
+    cxs = [e.crop_box.cx for e in candidates]
+    cys = [e.crop_box.cy for e in candidates]
+    angles = [e.rotation_deg for e in candidates]
+    med_long = float(np.median(longs))
+    med_short = float(np.median(shorts))
+    med_cx = float(np.median(cxs))
+    med_cy = float(np.median(cys))
+    med_angle = float(np.median(angles))
+
+    unified = 0
+    for entry in candidates:
+        # Preserve each entry's portrait/landscape orientation.
+        is_portrait = entry.crop_box.h > entry.crop_box.w
+        w = med_short if is_portrait else med_long
+        h = med_long if is_portrait else med_short
+        src = input_folder / entry.filename
+        if not src.exists():
+            continue
+        loaded = load_image(src)
+        box = CropBox(cx=med_cx, cy=med_cy, w=w, h=h)
+        cropped = apply_user_edit(
+            loaded.bgr, med_angle, box, upright_qt=entry.upright_rotation_qt
+        )
+        if cropped is None or cropped.size == 0:
+            continue
+        raw_cropped = cropped
+        toned_cropped = auto_tone(raw_cropped)
+        save_jpeg(preview_path_for(input_folder, entry.filename), toned_cropped, icc_profile=loaded.icc_profile)
+        save_jpeg(raw_preview_path_for(input_folder, entry.filename), raw_cropped, icc_profile=loaded.icc_profile)
+        save_thumbnail(
+            input_folder / CACHE_DIRNAME / THUMBS_DIRNAME / f"{Path(entry.filename).stem}.jpg",
+            toned_cropped if entry.auto_tone else raw_cropped,
+            max_edge=320,
+        )
+        if entry.decision == "approved":
+            visible = toned_cropped if entry.auto_tone else raw_cropped
+            save_jpeg(cropped_path_for(input_folder, entry.filename), visible, icc_profile=loaded.icc_profile)
+        entry.crop_box = CropBoxModel(cx=med_cx, cy=med_cy, w=w, h=h)
+        entry.rotation_deg = med_angle
+        entry.timestamp = _now_iso()
+        _prune_with_guide_cache(input_folder, entry.filename)
+        unified += 1
+
+    save_manifest(input_folder, manifest)
+    return unified
+
+
 def _prune_with_guide_cache(input_folder: Path, filename: str) -> None:
     """Delete cached 'original-with-guide' images for a filename. They are
     keyed by detected-corner coordinates, so any pre-existing entries are
@@ -438,7 +517,7 @@ def redetect_and_match_aspect(
     If detection fails on the new method, falls back to plain size
     snapping at the existing crop centre.
     """
-    from .straighten import CropBox, apply_user_edit, _scale_rect, CROP_SHRINK
+    from .straighten import CropBox, apply_user_edit, _scale_rect
 
     input_folder = input_folder.resolve()
     if target_long <= 0 or target_short <= 0:
@@ -464,7 +543,7 @@ def redetect_and_match_aspect(
         # target dims directly so the user still gets the requested ratio.
         return apply_size_to_entry(input_folder, filename, target_long, target_short)
 
-    rect_full = _scale_rect(detection.rect_small, detection.scale, CROP_SHRINK)
+    rect_full = _scale_rect(detection.rect_small, detection.scale, shrink_for_method(method))
     detected_long = max(rect_full.w, rect_full.h)
     new_long = detected_long
     new_short = new_long / target_aspect
@@ -542,6 +621,8 @@ def run_batch(
     workers: int | None = None,
     progress_callback=None,
     only_new: bool = False,
+    default_method: str = "auto",
+    force_method: str | None = None,
 ) -> Manifest:
     input_folder = input_folder.resolve()
     if not input_folder.is_dir():
@@ -561,7 +642,12 @@ def run_batch(
             # same result. `edited_by_user` is always preserved.
             skipped.append(prev)
             continue
-        method = prev.detection_method if prev is not None else "auto"
+        if force_method is not None:
+            method = force_method
+        elif prev is not None:
+            method = prev.detection_method
+        else:
+            method = default_method
         tasks.append((str(img), str(input_folder), method))
 
     new_entries: list[ManifestEntry] = []

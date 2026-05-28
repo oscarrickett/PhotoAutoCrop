@@ -13,6 +13,13 @@ from .detect import Detection, Rect
 # detection slop along the mat boundary so the output doesn't include a
 # sliver of grey mat at the photo's edge.
 CROP_SHRINK = 0.975
+# Slides have a softer photo→mount transition (anti-aliased film edge),
+# so we bite further inside to avoid a thin dark border in the output.
+CROP_SHRINK_SLIDE = 0.945
+
+
+def shrink_for_method(method: str) -> float:
+    return CROP_SHRINK_SLIDE if method == "slide" else CROP_SHRINK
 
 
 @dataclass

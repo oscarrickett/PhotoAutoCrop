@@ -134,6 +134,103 @@ html, body {
   border: 1px solid var(--border) !important;
 }
 
+#btn-quit {
+  background: transparent !important;
+  color: var(--reject) !important;
+  border: 1px solid var(--reject) !important;
+}
+
+.reprocess-group {
+  display: inline-flex;
+  position: relative;
+}
+.reprocess-group #btn-reprocess {
+  background: var(--accent);
+  color: white;
+  border: 0;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.reprocess-group #btn-reprocess:hover { filter: brightness(1.1); }
+.reprocess-group #btn-reprocess:disabled { opacity: 0.5; cursor: progress; }
+#btn-reprocess-menu {
+  background: var(--accent);
+  color: white;
+  border: 0;
+  border-left: 1px solid rgba(255, 255, 255, 0.25);
+  padding: 6px 10px;
+  border-top-right-radius: 6px;
+  border-bottom-right-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+#btn-reprocess-menu:hover { filter: brightness(1.1); }
+#reprocess-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.12);
+  z-index: 20;
+  min-width: 220px;
+  padding: 4px;
+}
+#reprocess-menu[hidden] { display: none; }
+#reprocess-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  padding: 8px 12px;
+  font: inherit;
+  cursor: pointer;
+  border-radius: 4px;
+  color: var(--fg);
+}
+#reprocess-menu button:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+#btn-quit:hover {
+  background: var(--reject) !important;
+  color: white !important;
+  filter: none !important;
+}
+
+.method-picker {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 12px 0 14px;
+  background: white;
+  text-align: left;
+}
+.method-picker legend {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 0 6px;
+}
+.method-picker label {
+  display: block;
+  font-size: 13px;
+  padding: 4px 0;
+  cursor: pointer;
+}
+.method-picker input[type="radio"] {
+  accent-color: var(--accent);
+  margin-right: 8px;
+  vertical-align: -2px;
+}
+
 .row-toggle {
   display: inline-flex;
   align-items: center;

@@ -25,7 +25,15 @@
     </nav>
     <button id="btn-save-all" title="Mark every Needs review photo as Saved in one click">Save all</button>
     <button id="btn-change-folder" title="Pick a different folder">Change folder</button>
-    <button id="btn-reprocess" title="Re-run auto-crop on files not yet user-edited">Reprocess</button>
+    <div class="reprocess-group">
+      <button id="btn-reprocess" title="Pick up any new files in this folder">Reprocess</button>
+      <button id="btn-reprocess-menu" title="More reprocess options" aria-label="More reprocess options">▾</button>
+      <div id="reprocess-menu" hidden>
+        <button data-method="auto">Pick up new files only</button>
+        <button data-method="slide">Re-detect all as slides</button>
+      </div>
+    </div>
+    <button id="btn-quit" title="Shut down PhotoAutoCrop">Quit</button>
   </header>
   <div id="review-progress" hidden title="Review progress">
     <div id="review-progress-fill"></div>
@@ -38,6 +46,11 @@
       <h1>Scan auto-finisher</h1>
       <p class="picker-sub">Paste the path to a folder of JPG scans. Each photo is detected against the mat, straightened, rotated upright (face detection), and grouped by print size so 4×6, 5×7, … prints all snap to consistent dimensions. Review and tweak side-by-side before saving.</p>
       <input id="folder-path" type="text" spellcheck="false" placeholder="e.g. C:\Users\you\Pictures\Scans" />
+      <fieldset class="method-picker" id="folder-method">
+        <legend>What's in the folder?</legend>
+        <label><input type="radio" name="method" value="auto" checked /> Photos on a grey mat</label>
+        <label><input type="radio" name="method" value="slide" /> Scanned slides (black mount border)</label>
+      </fieldset>
       <button id="btn-open-folder">Process folder</button>
       <div id="folder-progress" hidden>
         <div class="progress-line">
@@ -95,6 +108,9 @@
         <div class="ctl-buttons">
           <button id="btn-reset">Reset to auto</button>
           <button id="btn-fit-frame">Fit to frame</button>
+        </div>
+        <div class="ctl-buttons">
+          <button id="btn-redetect-slide" title="Re-detect this photo as a scanned slide (finds the bright image inside the dark mount)">Re-detect as slide</button>
         </div>
         <div class="ctl-buttons">
           <button id="btn-reset-rotation" title="Set rotation back to 0°">Reset rotation</button>

@@ -33,6 +33,7 @@ from .pipeline import (
     reprocess_one,
     save_manifest,
     run_batch,
+    unify_slide_crops,
 )
 from .schemas import (
     CropBoxModel,
@@ -130,24 +131,43 @@ def get_progress() -> JSONResponse:
     return JSONResponse(snap)
 
 
-def _bg_pipeline(folder: Path) -> None:
+def _bg_pipeline(folder: Path, default_method: str = "auto") -> None:
     def cb(i: int, total: int, entry) -> None:
         with _progress_lock:
             _progress["done"] = i
             _progress["total"] = total
             _progress["current"] = entry.filename
     try:
-        # Skip files that already have a manifest entry — detection is
-        # deterministic, so re-running it on every open would just burn
-        # CPU for the same result. Only newly-added JPGs are processed.
         manifest = load_manifest(folder)
         existing_names = {e.filename for e in manifest.entries}
+        edited_names = {e.filename for e in manifest.entries if e.edited_by_user}
         files = discover_inputs(folder)
-        new_files = [f for f in files if f.name not in existing_names]
-        with _progress_lock:
-            _progress["total"] = len(new_files)
-        if new_files:
-            run_batch(folder, progress_callback=cb, only_new=True)
+        if default_method == "auto":
+            # Default open: detection is deterministic, so only process
+            # files that don't already have a manifest entry.
+            to_process = [f for f in files if f.name not in existing_names]
+            with _progress_lock:
+                _progress["total"] = len(to_process)
+            if to_process:
+                run_batch(folder, progress_callback=cb, only_new=True)
+        else:
+            # User explicitly picked a method (e.g. "slide"). Re-run
+            # detection on every non-user-edited file with that method —
+            # otherwise existing manifest entries stay stuck on whatever
+            # method they were first processed with.
+            to_process = [f for f in files if f.name not in edited_names]
+            with _progress_lock:
+                _progress["total"] = len(to_process)
+            if to_process:
+                run_batch(
+                    folder,
+                    progress_callback=cb,
+                    only_new=False,
+                    default_method=default_method,
+                    force_method=default_method,
+                )
+            if default_method == "slide":
+                unify_slide_crops(folder)
     except Exception as exc:
         with _progress_lock:
             _progress["error"] = str(exc)
@@ -155,6 +175,9 @@ def _bg_pipeline(folder: Path) -> None:
         with _progress_lock:
             _progress["running"] = False
             _progress["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+VALID_METHODS = {"auto", "small", "loose", "edges", "slide"}
 
 
 @app.post("/api/open-folder")
@@ -167,6 +190,9 @@ def open_folder(req: dict) -> JSONResponse:
         raise HTTPException(status_code=404, detail=f"folder not found: {folder}")
     if not folder.is_dir():
         raise HTTPException(status_code=400, detail=f"not a folder: {folder}")
+    method = (req or {}).get("method", "auto") or "auto"
+    if method not in VALID_METHODS:
+        raise HTTPException(status_code=400, detail=f"unknown method: {method}")
     set_input_folder(folder)
     with _progress_lock:
         if _progress["running"]:
@@ -177,8 +203,8 @@ def open_folder(req: dict) -> JSONResponse:
             "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "finished_at": None, "eta_seconds": None,
         })
-    threading.Thread(target=_bg_pipeline, args=(folder,), daemon=True).start()
-    return JSONResponse({"ok": True, "folder": str(folder)})
+    threading.Thread(target=_bg_pipeline, args=(folder, method), daemon=True).start()
+    return JSONResponse({"ok": True, "folder": str(folder), "method": method})
 
 
 def _now() -> str:
@@ -525,24 +551,64 @@ def save_all() -> JSONResponse:
 
 
 @app.post("/api/reprocess")
-def reprocess() -> JSONResponse:
-    """Pick up any JPGs that have appeared in the folder since the manifest
-    was last written. Doesn't touch files that already have a manifest
-    entry — re-running the deterministic detector on them would produce
-    identical results.
+def reprocess(method: str = "auto") -> JSONResponse:
+    """Re-run detection.
+
+    method="auto" (default): only picks up JPGs added since the manifest
+    was last written — re-running the deterministic detector on
+    already-processed files would produce identical results.
+
+    Any other method (e.g. "slide"): re-runs detection on EVERY file in
+    the folder with that method, including ones the user has previously
+    touched. The user is explicitly opting into a different detection
+    mode for the whole batch, which overrides any prior per-photo
+    edits/saves.
     """
     folder = _folder()
+    if method not in VALID_METHODS:
+        raise HTTPException(status_code=400, detail=f"unknown method: {method}")
     manifest = load_manifest(folder)
     existing_names = {e.filename for e in manifest.entries}
     images = discover_inputs(folder)
-    new_files = [img for img in images if img.name not in existing_names]
-    if not new_files:
-        return JSONResponse({"ok": True, "processed": 0, "filenames": []})
-    run_batch(folder, only_new=True)
+    if method == "auto":
+        to_process = [img for img in images if img.name not in existing_names]
+        if not to_process:
+            return JSONResponse({"ok": True, "processed": 0, "filenames": []})
+        run_batch(folder, only_new=True)
+    else:
+        # Clear edited_by_user so run_batch doesn't skip these files.
+        # The user just asked for an explicit method override — that
+        # supersedes any previous "I clicked save on this" flag.
+        for entry in manifest.entries:
+            entry.edited_by_user = False
+        save_manifest(folder, manifest)
+        to_process = list(images)
+        if not to_process:
+            return JSONResponse({"ok": True, "processed": 0, "filenames": []})
+        run_batch(
+            folder,
+            only_new=False,
+            default_method=method,
+            force_method=method,
+        )
+        # Slides come off the scanner at a fixed position — snap every
+        # entry to the median rect so the whole batch is identically
+        # framed instead of jittering per-photo.
+        unified = 0
+        if method == "slide":
+            unified = unify_slide_crops(folder)
+        return JSONResponse({
+            "ok": True,
+            "processed": len(to_process),
+            "filenames": [f.name for f in to_process],
+            "method": method,
+            "unified": unified,
+        })
     return JSONResponse({
         "ok": True,
-        "processed": len(new_files),
-        "filenames": [f.name for f in new_files],
+        "processed": len(to_process),
+        "filenames": [f.name for f in to_process],
+        "method": method,
     })
 
 
@@ -651,6 +717,21 @@ def apply_size_clusters(req: dict) -> JSONResponse:
             except Exception as exc:
                 errors.append(f"{fn}: {exc}")
     return JSONResponse({"ok": True, "updated": updated_filenames, "errors": errors})
+
+
+@app.post("/api/shutdown")
+def shutdown() -> JSONResponse:
+    """Quit PhotoAutoCrop from the browser. Schedules a process exit on a
+    short delay so this response flushes back to the client first.
+    """
+    import os as _os
+    import threading as _threading
+
+    def _kill() -> None:
+        _os._exit(0)
+
+    _threading.Timer(0.3, _kill).start()
+    return JSONResponse({"ok": True, "message": "shutting down"})
 
 
 if WEB_DIR.exists():
