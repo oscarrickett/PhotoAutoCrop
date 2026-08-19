@@ -36,6 +36,10 @@ class Detection:
     mat_mask: np.ndarray | None
     photo_mask: np.ndarray | None
     notes: list[str]
+    # True when the rect already matches the target crop exactly (no
+    # need to apply the method's shrink). Set by negative sprocket
+    # detection where we know the image bounds precisely.
+    precise_crop: bool = False
 
     @property
     def found(self) -> bool:
@@ -159,6 +163,38 @@ def _photo_mask_edges(small_bgr: np.ndarray) -> np.ndarray:
     return filled
 
 
+def _photo_mask_negative(small_bgr: np.ndarray) -> np.ndarray:
+    """For scanned colour negatives: pink film rectangle on the black
+    scanner bed. Luminance alone fails because dark interior scenes
+    approach the bed's brightness. Instead, threshold on the LAB
+    a-channel — the film base's orange-pink mask sits well into the
+    positive-a (red) region, while the scanner bed is neutral. Then
+    close aggressively so neutral patches inside the image (blue sky,
+    grey walls) get filled back in as part of the film blob.
+    """
+    h, w = small_bgr.shape[:2]
+    lab = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2LAB)
+    L = lab[:, :, 0]
+    a = lab[:, :, 1].astype(np.int16) - 128
+    # Pink cast AND not pure-black bed. a > 6 catches the film base
+    # everywhere the orange mask is visible; L > 25 excludes the bed
+    # without cutting into dim image interior.
+    mask = (((a > 6) & (L > 25)).astype(np.uint8)) * 255
+    if mask.sum() // 255 < 0.05 * h * w:
+        return np.zeros((h, w), np.uint8)
+    # Modest close: fill neutral interior patches (blue sky → cyan in
+    # the raw negative → drops out of the a-channel mask) without
+    # dilating the blob past the film's true boundary. Larger kernels
+    # bleed the mask out to the scan edges when the bed border is thin.
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    )
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    )
+    return mask
+
+
 def _photo_mask_slide(small_bgr: np.ndarray) -> np.ndarray:
     """For scanned slides: bright image rectangle in a dark mount surround.
 
@@ -198,7 +234,7 @@ def _photo_mask_slide(small_bgr: np.ndarray) -> np.ndarray:
     return above
 
 
-METHODS = ("auto", "small", "loose", "edges", "slide")
+METHODS = ("auto", "small", "loose", "edges", "slide", "negative")
 
 
 def _photo_mask(small_bgr: np.ndarray, method: str = "auto") -> np.ndarray:
@@ -210,6 +246,8 @@ def _photo_mask(small_bgr: np.ndarray, method: str = "auto") -> np.ndarray:
         return _photo_mask_edges(small_bgr)
     if method == "slide":
         return _photo_mask_slide(small_bgr)
+    if method == "negative":
+        return _photo_mask_negative(small_bgr)
     return _photo_mask_auto(small_bgr)
 
 
@@ -226,7 +264,10 @@ def _touches_frame(contour: np.ndarray, shape: tuple[int, int], margin: int) -> 
 
 
 def _select_contour(
-    photo_mask: np.ndarray, small_shape: tuple[int, int]
+    photo_mask: np.ndarray,
+    small_shape: tuple[int, int],
+    allow_frame_touchers: bool = False,
+    max_area_fraction: float = MAX_AREA_FRACTION,
 ) -> tuple[np.ndarray | None, list[str]]:
     notes: list[str] = []
     contours, _ = cv2.findContours(photo_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -236,7 +277,7 @@ def _select_contour(
     h, w = small_shape
     frame_area = h * w
     min_area = MIN_AREA_FRACTION * frame_area
-    max_area = MAX_AREA_FRACTION * frame_area
+    max_area = max_area_fraction * frame_area
     ranked = sorted(contours, key=cv2.contourArea, reverse=True)
     saw_frame_toucher = False
     for c in ranked:
@@ -245,6 +286,8 @@ def _select_contour(
             continue
         if _touches_frame(c, small_shape, FRAME_EDGE_MARGIN_PX):
             saw_frame_toucher = True
+            if allow_frame_touchers:
+                return c, notes
             continue
         return c, notes
     if saw_frame_toucher:
@@ -300,10 +343,13 @@ def _refine_rotation(small_bgr: np.ndarray, photo_mask: np.ndarray, fallback: fl
     if lines is None or len(lines) < 2:
         return fallback
 
+    # OpenCV 4.x returns lines as shape (N, 1, 4); OpenCV 5.x drops the
+    # middle dim to (N, 4). Flatten so ln unpacks the same way either way.
+    lines = np.asarray(lines).reshape(-1, 4)
     angles: list[float] = []
     weights: list[float] = []
     for ln in lines:
-        x1, y1, x2, y2 = ln[0]
+        x1, y1, x2, y2 = ln
         if x2 == x1:
             theta = 90.0
         else:
@@ -334,13 +380,275 @@ def _refine_rotation(small_bgr: np.ndarray, photo_mask: np.ndarray, fallback: fl
     return refined
 
 
+def _refine_inside_sprocket_rect(
+    small_bgr: np.ndarray, outer: Rect
+) -> tuple[Rect | None, list[str]]:
+    """Second-pass detection: crop the sprocket-detected film area,
+    invert to positive, and locate the image's inner boundary by
+    projection. If a clear inner rect is found and it's meaningfully
+    smaller than the outer, return it; otherwise return None so the
+    caller keeps the sprocket rect.
+
+    Uses column/row projection on the a-channel of the inverted crop
+    to detect the transition from the residual film-base border
+    (dark and cyan-tinted after inversion) to the image content
+    (variable but generally more chromatic).
+    """
+    from .negative import negative_to_positive
+    h, w = small_bgr.shape[:2]
+    # Extract axis-aligned crop around the outer rect.
+    half_w = outer.w / 2.0; half_h = outer.h / 2.0
+    x1 = int(max(0, round(outer.cx - half_w)))
+    y1 = int(max(0, round(outer.cy - half_h)))
+    x2 = int(min(w, round(outer.cx + half_w)))
+    y2 = int(min(h, round(outer.cy + half_h)))
+    if x2 - x1 < 40 or y2 - y1 < 40:
+        return None, ["inner_crop_too_small"]
+    crop = small_bgr[y1:y2, x1:x2]
+    positive = negative_to_positive(crop)
+    ph, pw = positive.shape[:2]
+    # Residual film base after inversion is a low-saturation dark
+    # cyan strip; image content is more chromatic. Threshold on
+    # LAB chroma to separate image from border, then take the largest
+    # contour and its axis-aligned bounding rect.
+    lab = cv2.cvtColor(positive, cv2.COLOR_BGR2LAB)
+    a = lab[:, :, 1].astype(np.int16) - 128
+    b = lab[:, :, 2].astype(np.int16) - 128
+    chroma = np.sqrt(a * a + b * b).astype(np.uint8)
+    # Also flag "meaningfully bright" pixels to catch scene highlights
+    # that might be near-neutral (whites, greys) — those are image too.
+    L = lab[:, :, 0]
+    fg = ((chroma > 12) | (L > 90)).astype(np.uint8) * 255
+    fg = cv2.morphologyEx(
+        fg, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    )
+    fg = cv2.morphologyEx(
+        fg, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    )
+    contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, ["inner_no_contour"]
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 0.3 * ph * pw:
+        return None, ["inner_contour_too_small"]
+    x, y, bw, bh = cv2.boundingRect(largest)
+
+    # Only trim if the refinement actually shrinks the rect. Reject
+    # tiny gains (<2% each side) and absurd shrinks (>25% each side).
+    inset_top = y; inset_bot = ph - (y + bh)
+    inset_left = x; inset_right = pw - (x + bw)
+    max_edge = min(ph, pw)
+    if max(inset_top, inset_bot, inset_left, inset_right) < 0.02 * max_edge:
+        return None, ["inner_edges_already_tight"]
+    if min(inset_top, inset_bot, inset_left, inset_right) > 0.25 * max_edge:
+        return None, ["inner_edges_shrank_too_much"]
+
+    new_w = float(bw); new_h = float(bh)
+    new_cx = x1 + x + bw / 2.0
+    new_cy = y1 + y + bh / 2.0
+    return Rect(
+        cx=new_cx, cy=new_cy,
+        w=max(new_w, new_h), h=min(new_w, new_h),
+        angle=outer.angle,
+    ), ["inner_edges_refined"]
+
+
+def _detect_from_sprockets(small_bgr: np.ndarray) -> tuple[Rect | None, list[str]]:
+    """Find sprocket-hole strips on a scanned negative via 1D
+    projection and return the image Rect between them.
+
+    Approach: the film has two bright strips running along its long
+    edges (the sprocket rows), separated by a darker image band. In
+    the row-mean projection this appears as two prominent peaks
+    flanking a broad valley. Same in reverse for the col-mean when
+    the film is scanned in portrait orientation. Projection is much
+    more robust than per-hole blob detection because it averages away
+    per-hole brightness variation.
+    """
+    h, w = small_bgr.shape[:2]
+    gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    def _find_strip_peaks(proj: np.ndarray, length: int) -> tuple[int, int, int, int] | None:
+        """Locate top/bottom sprocket-strip peaks. Returns (top_peak,
+        top_inner_edge, bottom_inner_edge, bottom_peak) or None.
+        Inner edges are where the projection drops below the midpoint
+        between peak brightness and interior brightness — that's the
+        transition from sprocket strip to image band.
+        """
+        # Search windows: peaks live in the outer ~15% of the film's
+        # long dimension. Bed is even further out (very dark), so a
+        # generous window is fine — we take argmax within it.
+        window = max(20, length // 6)
+        top_peak = int(np.argmax(proj[:window]))
+        bot_peak = int(length - window + np.argmax(proj[length - window:]))
+        top_val = float(proj[top_peak])
+        bot_val = float(proj[bot_peak])
+        # Interior brightness = median of the mid 60%.
+        interior = float(np.median(proj[length // 5 : 4 * length // 5]))
+        # Peaks must be substantially brighter than interior.
+        if top_val - interior < 30 or bot_val - interior < 30:
+            return None
+        # Bail if peaks are absurdly close (< 40% of length apart —
+        # can't be film + image + film).
+        if bot_peak - top_peak < 0.4 * length:
+            return None
+        # Inner edge: first row after each peak where the projection
+        # falls at least halfway back to interior.
+        top_mid = (top_val + interior) / 2.0
+        bot_mid = (bot_val + interior) / 2.0
+        top_inner = top_peak
+        for i in range(top_peak, length):
+            if proj[i] <= top_mid:
+                top_inner = i
+                break
+        bot_inner = bot_peak
+        for i in range(bot_peak, -1, -1):
+            if proj[i] <= bot_mid:
+                bot_inner = i
+                break
+        if bot_inner <= top_inner + 20:
+            return None
+        return top_peak, top_inner, bot_inner, bot_peak
+
+    row_proj = gray.mean(axis=1)
+    col_proj = gray.mean(axis=0)
+    row_result = _find_strip_peaks(row_proj, h)
+    col_result = _find_strip_peaks(col_proj, w)
+
+    # Pick landscape (sprockets on top/bottom = row peaks) if row peaks
+    # are stronger, else portrait. Prefer landscape when both work
+    # and film width > film height in the found rect.
+    def strength(proj: np.ndarray, result: tuple[int, int, int, int]) -> float:
+        if result is None:
+            return 0.0
+        tp, _, _, bp = result
+        interior_mid = float(np.median(proj[len(proj) // 5 : 4 * len(proj) // 5]))
+        return (float(proj[tp]) + float(proj[bp])) / 2.0 - interior_mid
+
+    row_strength = strength(row_proj, row_result)
+    col_strength = strength(col_proj, col_result)
+
+    if row_result is None and col_result is None:
+        return None, ["no_sprocket_projection_peaks"]
+
+    landscape = row_strength >= col_strength
+
+    if landscape and row_result is not None:
+        _, top_inner, bot_inner, _ = row_result
+        image_top = float(top_inner)
+        image_bottom = float(bot_inner)
+        # Left/right image edges: use col projection but look for the
+        # transition from bed (very dark) to film (bright), not
+        # sprocket peaks. The film's L is stable across the whole
+        # width until it drops off into the black bed.
+        bed_level = float(np.percentile(col_proj, 10))
+        film_level = float(np.median(col_proj))
+        thresh = (bed_level + film_level) / 2.0
+        left = 0
+        for i in range(len(col_proj)):
+            if col_proj[i] > thresh:
+                left = i
+                break
+        right = len(col_proj) - 1
+        for i in range(len(col_proj) - 1, -1, -1):
+            if col_proj[i] > thresh:
+                right = i
+                break
+        image_left = float(left)
+        image_right = float(right)
+    elif col_result is not None:
+        _, left_inner, right_inner, _ = col_result
+        image_left = float(left_inner)
+        image_right = float(right_inner)
+        bed_level = float(np.percentile(row_proj, 10))
+        film_level = float(np.median(row_proj))
+        thresh = (bed_level + film_level) / 2.0
+        top = 0
+        for i in range(len(row_proj)):
+            if row_proj[i] > thresh:
+                top = i
+                break
+        bot = len(row_proj) - 1
+        for i in range(len(row_proj) - 1, -1, -1):
+            if row_proj[i] > thresh:
+                bot = i
+                break
+        image_top = float(top)
+        image_bottom = float(bot)
+    else:
+        return None, ["no_sprocket_projection_peaks"]
+
+    rw = image_right - image_left
+    rh = image_bottom - image_top
+    if rw <= 20 or rh <= 20:
+        return None, ["sprocket_rect_too_small"]
+
+    cx = (image_left + image_right) / 2.0
+    cy = (image_top + image_bottom) / 2.0
+    # Angle is left as 0 here — the caller refines it via the film-mask
+    # boundary (Hough lines), which is much more robust than trying to
+    # fit through discrete sprocket-hole peak positions.
+    return Rect(cx=cx, cy=cy, w=max(rw, rh), h=min(rw, rh), angle=0.0), []
+
+
 def detect(bgr: np.ndarray, method: str = "auto") -> Detection:
     full_shape = (bgr.shape[0], bgr.shape[1])
     small, scale = _resize_for_detection(bgr)
     small_shape = (small.shape[0], small.shape[1])
     mat = _mat_mask(small)
     photo = _photo_mask(small, method=method)
-    contour, notes = _select_contour(photo, small_shape)
+
+    if method == "negative":
+        sprocket_rect, sprocket_notes = _detect_from_sprockets(small)
+        if sprocket_rect is not None:
+            # Second pass: within the sprocket-detected film area, run
+            # inner-edge detection on the inverted (positive) crop to
+            # find the actual image boundary and shed any residual film
+            # base still hugging the crop.
+            refined_rect, refine_notes = _refine_inside_sprocket_rect(
+                small, sprocket_rect
+            )
+            if refined_rect is not None:
+                sprocket_rect = refined_rect
+                sprocket_notes = list(sprocket_notes) + refine_notes
+            # Refine rotation from the film-mask boundary — the per-
+            # column peak-fit inside the sprocket strip is noisy
+            # because sprocket holes are discrete features. The mask
+            # boundary is a continuous edge that Hough handles well.
+            mask_angle = _refine_rotation(small, photo, sprocket_rect.angle)
+            # Projection gives axis-aligned bounds; cv2.boxPoints treats
+            # (w, h) as the tilted rect's OWN dimensions. Convert bounds
+            # → true dims so the drawn corners match the film.
+            th = float(np.radians(mask_angle))
+            c = float(np.cos(th)); s = float(abs(np.sin(th)))
+            det = c * c - s * s
+            if abs(det) > 0.001:
+                true_w = (sprocket_rect.w * c - sprocket_rect.h * s) / det
+                true_h = (sprocket_rect.h * c - sprocket_rect.w * s) / det
+            else:
+                true_w, true_h = sprocket_rect.w, sprocket_rect.h
+            refined = Rect(
+                cx=sprocket_rect.cx, cy=sprocket_rect.cy,
+                w=max(10.0, true_w), h=max(10.0, true_h),
+                angle=mask_angle,
+            )
+            return Detection(
+                rect_small=refined, contour_small=None, scale=scale,
+                small_shape=small_shape, full_shape=full_shape,
+                mat_mask=mat, photo_mask=photo,
+                notes=["sprockets_detected", *sprocket_notes],
+                precise_crop=True,
+            )
+    # Negatives fill almost the entire scan with just a thin scanner-bed
+    # border — the standard MAX_AREA_FRACTION=0.97 rejects them. Slide
+    # mounts also tend to be tight-cropped by the scanner. Both need the
+    # ceiling lifted and frame-touchers permitted.
+    contour, notes = _select_contour(
+        photo,
+        small_shape,
+        allow_frame_touchers=method in ("slide", "negative"),
+        max_area_fraction=0.998 if method == "negative" else MAX_AREA_FRACTION,
+    )
     if contour is None:
         return Detection(
             rect_small=None, contour_small=None, scale=scale,

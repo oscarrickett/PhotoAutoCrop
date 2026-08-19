@@ -16,10 +16,25 @@ CROP_SHRINK = 0.975
 # Slides have a softer photo→mount transition (anti-aliased film edge),
 # so we bite further inside to avoid a thin dark border in the output.
 CROP_SHRINK_SLIDE = 0.945
+# Negatives: the detected rect encloses the entire film area including
+# the sprocket-hole strip on the two long edges (35mm sprockets run
+# along the frame's long edges, so along the short axis of the rect
+# they eat significantly into the crop). Shrink the short axis much
+# more than the long axis.
+CROP_SHRINK_NEGATIVE_LONG = 0.965
+CROP_SHRINK_NEGATIVE_SHORT = 0.80
 
 
-def shrink_for_method(method: str) -> float:
-    return CROP_SHRINK_SLIDE if method == "slide" else CROP_SHRINK
+def shrink_for_method(method: str) -> float | tuple[float, float]:
+    """Return the crop shrink for a detection method. Most methods use
+    a single uniform shrink factor; negatives use asymmetric (long,
+    short) because the sprocket strip only eats into the short axis.
+    """
+    if method == "slide":
+        return CROP_SHRINK_SLIDE
+    if method == "negative":
+        return (CROP_SHRINK_NEGATIVE_LONG, CROP_SHRINK_NEGATIVE_SHORT)
+    return CROP_SHRINK
 
 
 @dataclass
@@ -52,9 +67,22 @@ def apply_quarter_turns(bgr: np.ndarray, k: int) -> np.ndarray:
     return cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
 
-def _scale_rect(rect: Rect, scale: float, shrink: float) -> Rect:
-    w_small = max(1.0, rect.w * shrink)
-    h_small = max(1.0, rect.h * shrink)
+def _scale_rect(rect: Rect, scale: float, shrink) -> Rect:
+    """Scale rect from small-frame to full-frame coords, optionally
+    shrinking. ``shrink`` is either a single float (applied to both
+    axes) or a (long, short) tuple applied along the rect's own long
+    and short dimensions.
+    """
+    if isinstance(shrink, tuple):
+        shrink_long, shrink_short = shrink
+        if rect.w >= rect.h:
+            sw, sh = shrink_long, shrink_short
+        else:
+            sw, sh = shrink_short, shrink_long
+    else:
+        sw = sh = shrink
+    w_small = max(1.0, rect.w * sw)
+    h_small = max(1.0, rect.h * sh)
     return Rect(
         cx=rect.cx / scale,
         cy=rect.cy / scale,
@@ -102,7 +130,7 @@ def _crop_to_box(bgr: np.ndarray, box: CropBox) -> np.ndarray | None:
 def straighten_and_crop(
     bgr: np.ndarray,
     detection: Detection,
-    shrink: float = CROP_SHRINK,
+    shrink=CROP_SHRINK,
 ) -> StraightenResult | None:
     if not detection.found or detection.rect_small is None:
         return None

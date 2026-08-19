@@ -46,7 +46,7 @@ class ManifestEntry(BaseModel):
     detected_corners: Optional[list[Point]] = None
     # Detection algorithm the user has elected for this image. Sticks
     # across re-runs so a "this is a small photo" choice keeps applying.
-    detection_method: Literal["auto", "small", "loose", "edges", "slide"] = "auto"
+    detection_method: Literal["auto", "small", "loose", "edges", "slide", "negative"] = "auto"
     notes: list[str] = []
     error: Optional[str] = None
     edited_by_user: bool = False
@@ -73,7 +73,7 @@ class SaveEditRequest(BaseModel):
 
 class RedetectRequest(BaseModel):
     filename: str
-    method: Literal["auto", "small", "loose", "edges", "slide"] = "auto"
+    method: Literal["auto", "small", "loose", "edges", "slide", "negative"] = "auto"
 
 
 class RotateUprightRequest(BaseModel):

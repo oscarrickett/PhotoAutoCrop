@@ -34,6 +34,7 @@ from .pipeline import (
     save_manifest,
     run_batch,
     unify_slide_crops,
+    unify_negative_crops,
 )
 from .schemas import (
     CropBoxModel,
@@ -71,6 +72,7 @@ _progress: dict = {
     "running": False, "total": 0, "done": 0,
     "current": "", "error": None,
     "started_at": None, "finished_at": None, "eta_seconds": None,
+    "phase": "idle", "phase_label": "",
 }
 _progress_lock = threading.Lock()
 
@@ -166,8 +168,28 @@ def _bg_pipeline(folder: Path, default_method: str = "auto") -> None:
                     default_method=default_method,
                     force_method=default_method,
                 )
-            if default_method == "slide":
-                unify_slide_crops(folder)
+            if default_method in ("slide", "negative"):
+                def unify_cb(i: int, total: int, entry) -> None:
+                    with _progress_lock:
+                        _progress["done"] = i
+                        _progress["total"] = total
+                        _progress["current"] = entry.filename
+                label = (
+                    "Aligning slide crops" if default_method == "slide"
+                    else "Aligning negative crops"
+                )
+                with _progress_lock:
+                    _progress["phase"] = "unifying"
+                    _progress["phase_label"] = label
+                    _progress["done"] = 0
+                    _progress["total"] = 0
+                    _progress["current"] = ""
+                    _progress["started_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                unify_fn = (
+                    unify_slide_crops if default_method == "slide"
+                    else unify_negative_crops
+                )
+                unify_fn(folder, progress_callback=unify_cb)
     except Exception as exc:
         with _progress_lock:
             _progress["error"] = str(exc)
@@ -175,9 +197,11 @@ def _bg_pipeline(folder: Path, default_method: str = "auto") -> None:
         with _progress_lock:
             _progress["running"] = False
             _progress["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            _progress["phase"] = "idle"
+            _progress["phase_label"] = ""
 
 
-VALID_METHODS = {"auto", "small", "loose", "edges", "slide"}
+VALID_METHODS = {"auto", "small", "loose", "edges", "slide", "negative"}
 
 
 @app.post("/api/open-folder")
@@ -202,6 +226,7 @@ def open_folder(req: dict) -> JSONResponse:
             "current": "", "error": None,
             "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "finished_at": None, "eta_seconds": None,
+            "phase": "processing", "phase_label": "",
         })
     threading.Thread(target=_bg_pipeline, args=(folder, method), daemon=True).start()
     return JSONResponse({"ok": True, "folder": str(folder), "method": method})
@@ -308,7 +333,35 @@ def get_original(filename: str) -> FileResponse:
     p = _input_path(filename)
     if not p.exists():
         raise HTTPException(status_code=404, detail="original not found")
+    positive = _positive_original_path(filename)
+    if positive is not None:
+        return FileResponse(positive, media_type="image/jpeg")
     return FileResponse(p, media_type="image/jpeg")
+
+
+def _positive_original_path(filename: str) -> Path | None:
+    """For negative-method entries, return a disk-cached path to the
+    original scan inverted to positive. First call generates and caches
+    the file; subsequent calls hit the cache. Returns None for
+    non-negative entries so the raw JPG is served as-is.
+    """
+    entry = _entry_for(filename)
+    if entry is None or entry.detection_method != "negative":
+        return None
+    folder = _folder()
+    src = _input_path(filename)
+    cache_dir = folder / CACHE_DIRNAME / "positive_original"
+    cache_path = cache_dir / f"{Path(filename).stem}.jpg"
+    if cache_path.exists() and cache_path.stat().st_mtime >= src.stat().st_mtime:
+        return cache_path
+    from .negative import negative_to_positive
+    from .auto_tone import auto_tone as _auto_tone
+    loaded = load_image(src)
+    positive = negative_to_positive(loaded.bgr)
+    positive = _auto_tone(positive)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    save_jpeg(cache_path, positive, icc_profile=loaded.icc_profile)
+    return cache_path
 
 
 @app.get("/api/output/{filename}")
@@ -373,7 +426,12 @@ def get_original_with_guide(filename: str, max_edge: int = 600) -> Response:
     if cache_path.exists():
         return FileResponse(cache_path, media_type="image/jpeg")
 
-    bgr = cv2.imread(str(src), cv2.IMREAD_COLOR)
+    # For negatives, render the guide over the inverted positive so the
+    # editor thumbnail and the "with guide" strip in the list view both
+    # show something recognisable instead of a pink negative.
+    positive_src = _positive_original_path(filename)
+    read_from = str(positive_src) if positive_src is not None else str(src)
+    bgr = cv2.imread(read_from, cv2.IMREAD_COLOR)
     if bgr is None:
         raise HTTPException(status_code=500, detail="cv2.imread failed")
 
@@ -445,6 +503,9 @@ def save_edit(req: SaveEditRequest) -> JSONResponse:
     raw_cropped = apply_user_edit(loaded.bgr, req.rotation_deg, box, upright_qt=upright_qt)
     if raw_cropped is None or raw_cropped.size == 0:
         raise HTTPException(status_code=400, detail="crop produced empty image")
+    if existing is not None and existing.detection_method == "negative":
+        from .negative import negative_to_positive
+        raw_cropped = negative_to_positive(raw_cropped)
     from .auto_tone import auto_tone as _auto_tone
     toned_cropped = _auto_tone(raw_cropped)
     # Per-photo Auto Tone — preserves the previous choice; defaults to on
@@ -597,6 +658,8 @@ def reprocess(method: str = "auto") -> JSONResponse:
         unified = 0
         if method == "slide":
             unified = unify_slide_crops(folder)
+        elif method == "negative":
+            unified = unify_negative_crops(folder)
         return JSONResponse({
             "ok": True,
             "processed": len(to_process),
@@ -649,6 +712,9 @@ def rotate_upright(req: RotateUprightRequest) -> JSONResponse:
     cropped = apply_user_edit(loaded.bgr, entry.rotation_deg, box, upright_qt=new_qt)
     if cropped is None or cropped.size == 0:
         raise HTTPException(status_code=400, detail="crop produced empty image")
+    if entry.detection_method == "negative":
+        from .negative import negative_to_positive
+        cropped = negative_to_positive(cropped)
     from .auto_tone import auto_tone as _auto_tone
     raw_cropped = cropped
     toned_cropped = _auto_tone(raw_cropped)

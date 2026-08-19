@@ -94,7 +94,13 @@
     const done = p.done || 0;
     const pct = total > 0 ? Math.round((100 * done) / total) : 0;
     $("#folder-progress-fill").style.width = pct + "%";
-    let label = total > 0 ? `${done} / ${total} (${pct}%)` : "Discovering files…";
+    const phaseLabel = p.phase_label || "";
+    let label;
+    if (phaseLabel) {
+      label = total > 0 ? `${phaseLabel}: ${done} / ${total} (${pct}%)` : `${phaseLabel}…`;
+    } else {
+      label = total > 0 ? `${done} / ${total} (${pct}%)` : "Discovering files…";
+    }
     if (typeof p.eta_seconds === "number" && p.eta_seconds > 0) {
       label += ` · ETA ${formatEta(p.eta_seconds)}`;
     }
@@ -885,6 +891,26 @@
     return { cx: local_x / k.fit, cy: local_y / k.fit, w: w / k.fit, h: h / k.fit };
   }
 
+  async function saveDecisionAndNext(decision) {
+    // Snapshot the ordered filtered list BEFORE saving so we know which
+    // entry to open next even if the just-saved one moves out of the
+    // current filter.
+    const before = filteredEntries();
+    const currentName = state.current?.filename;
+    const idx = currentName ? before.findIndex((e) => e.filename === currentName) : -1;
+    const nextName = idx >= 0 && idx + 1 < before.length ? before[idx + 1].filename : null;
+    await saveDecision(decision);
+    // saveDecision already refetched the manifest and closed the editor.
+    // Open the next entry — prefer the one that was originally next; if
+    // the saved entry left the filter, the same index now points at it.
+    const after = filteredEntries();
+    let candidate = null;
+    if (nextName) candidate = after.find((e) => e.filename === nextName);
+    if (!candidate && idx >= 0 && idx < after.length) candidate = after[idx];
+    if (candidate) openEditor(candidate);
+    else toast("No more photos in this filter");
+  }
+
   async function saveDecision(decision) {
     if (!state.current) return;
     const rotation = parseFloat($("#rotation-slider").value);
@@ -1131,6 +1157,8 @@
     $("#btn-back").addEventListener("click", closeEditorWithSave);
     const btnSlide = $("#btn-redetect-slide");
     if (btnSlide) btnSlide.addEventListener("click", () => redetectAs("slide"));
+    const btnNeg = $("#btn-redetect-negative");
+    if (btnNeg) btnNeg.addEventListener("click", () => redetectAs("negative"));
     $("#rotation-slider").addEventListener("input", updateRotationReadout);
     $("#btn-rotate-left").addEventListener("click", () => nudgeRotation(-0.5));
     $("#btn-rotate-right").addEventListener("click", () => nudgeRotation(0.5));
@@ -1160,6 +1188,7 @@
       k.overlayLayer.batchDraw();
     });
     $("#btn-approve").addEventListener("click", () => saveDecision("approved"));
+    $("#btn-approve-next").addEventListener("click", () => saveDecisionAndNext("approved"));
     $("#btn-reset-rotation").addEventListener("click", () => setRotation(0));
 
     document.addEventListener("keydown", (e) => {
@@ -1167,6 +1196,7 @@
       if (e.target.tagName === "INPUT") return;
       if (e.key === "Escape") closeEditorWithSave();
       else if (e.key === "s" || e.key === "S") saveDecision("approved");
+      else if (e.key === "n" || e.key === "N") saveDecisionAndNext("approved");
       else if (e.key === "Enter") saveDecision("approved");
       else if (e.key === "ArrowLeft") { nudgeRotation(e.shiftKey ? -0.1 : -0.5); e.preventDefault(); }
       else if (e.key === "ArrowRight") { nudgeRotation(e.shiftKey ? 0.1 : 0.5); e.preventDefault(); }
@@ -1274,7 +1304,8 @@
   // ---------- Re-detect a single photo from the editor ----------
   async function redetectAs(method) {
     if (!state.current) return;
-    const btn = $("#btn-redetect-slide");
+    const btnId = method === "negative" ? "#btn-redetect-negative" : "#btn-redetect-slide";
+    const btn = $(btnId);
     const original = btn ? btn.textContent : null;
     if (btn) { btn.disabled = true; btn.textContent = "Detecting…"; }
     try {

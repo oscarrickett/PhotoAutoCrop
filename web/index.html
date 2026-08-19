@@ -31,6 +31,7 @@
       <div id="reprocess-menu" hidden>
         <button data-method="auto">Pick up new files only</button>
         <button data-method="slide">Re-detect all as slides</button>
+        <button data-method="negative">Re-detect all as negatives</button>
       </div>
     </div>
     <button id="btn-quit" title="Shut down PhotoAutoCrop">Quit</button>
@@ -50,6 +51,7 @@
         <legend>What's in the folder?</legend>
         <label><input type="radio" name="method" value="auto" checked /> Photos on a grey mat</label>
         <label><input type="radio" name="method" value="slide" /> Scanned slides (black mount border)</label>
+        <label><input type="radio" name="method" value="negative" /> Scanned colour negatives (invert + de-mask)</label>
       </fieldset>
       <button id="btn-open-folder">Process folder</button>
       <div id="folder-progress" hidden>
@@ -73,7 +75,7 @@
       <button id="btn-back">&larr; Back to list</button>
       <div class="editor-filename" id="editor-filename"></div>
       <div class="editor-shortcuts">
-        <kbd>S</kbd> save &nbsp; <kbd>Esc</kbd> cancel &nbsp;
+        <kbd>S</kbd> save &nbsp; <kbd>N</kbd> save &amp; next &nbsp; <kbd>Esc</kbd> cancel &nbsp;
         <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> rotate &nbsp; <kbd>Shift</kbd> finer
       </div>
     </header>
@@ -111,6 +113,7 @@
         </div>
         <div class="ctl-buttons">
           <button id="btn-redetect-slide" title="Re-detect this photo as a scanned slide (finds the bright image inside the dark mount)">Re-detect as slide</button>
+          <button id="btn-redetect-negative" title="Re-detect this photo as a scanned colour negative (invert + de-mask)">Re-detect as negative</button>
         </div>
         <div class="ctl-buttons">
           <button id="btn-reset-rotation" title="Set rotation back to 0°">Reset rotation</button>
@@ -118,6 +121,7 @@
         <hr />
         <div class="ctl-buttons primary">
           <button id="btn-approve" class="approve">Save (S)</button>
+          <button id="btn-approve-next" class="approve" title="Save and open the next photo in this list">Save &amp; next (N)</button>
         </div>
         <p class="hint">Drag the crop rectangle's corners to resize, drag the body to move.</p>
       </aside>

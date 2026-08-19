@@ -21,6 +21,7 @@ from .io_utils import (
     save_thumbnail,
 )
 from .auto_tone import auto_tone
+from .negative import negative_to_positive
 from .orient import detect_upright_quarter_turns
 from .schemas import CropBoxModel, Manifest, ManifestEntry
 from .score import score_detection
@@ -42,6 +43,13 @@ _LEGACY_OUTPUT_DIRS = ("approved", "needs-review", "rejected")
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _positive(raw_bgr: np.ndarray, method: str | None) -> np.ndarray:
+    """Convert negatives to positives; pass everything else through."""
+    if method == "negative":
+        return negative_to_positive(raw_bgr)
+    return raw_bgr
 
 
 def ensure_layout(input_folder: Path) -> None:
@@ -166,6 +174,10 @@ def discover_inputs(input_folder: Path) -> list[Path]:
             continue
         if p.suffix not in SUPPORTED_EXTENSIONS:
             continue
+        # macOS metadata sidecars ("._filename.jpg") sit next to originals
+        # on OneDrive / external drives and aren't valid JPEGs.
+        if p.name.startswith("._"):
+            continue
         if any(_is_under(p, e) for e in excluded):
             continue
         if _is_legacy_reference_file(p):
@@ -261,7 +273,12 @@ def _process_one(args: tuple[str, str]) -> dict:
         small_bgr = loaded.bgr
 
     score = score_detection(detection, small_bgr)
-    result = straighten_and_crop(loaded.bgr, detection, shrink=shrink_for_method(method))
+    # Sprocket-based negative detection returns the exact image bounds
+    # already, but shave a symmetrical 2% (1% each side) so residual
+    # film-base slivers don't sneak into the final. Other paths return
+    # a shrink-target rect handled by the method's own shrink.
+    shrink = 0.98 if getattr(detection, "precise_crop", False) else shrink_for_method(method)
+    result = straighten_and_crop(loaded.bgr, detection, shrink=shrink)
     if result is None:
         remove_cropped_if_present(input_folder, src.name)
         return {
@@ -282,7 +299,13 @@ def _process_one(args: tuple[str, str]) -> dict:
     # No automatic approvals — every photo lands in needs-review for the
     # user to inspect and approve manually. The confidence score is still
     # computed and surfaced in the manifest / list view as a hint.
-    bucket = "rejected" if score.bucket == "rejected" else "needs-review"
+    # Precise-crop detections (e.g. sprocket-based negatives) synthesise
+    # a rect without a contour, so the scorer returns 0; treat them as
+    # needs-review regardless.
+    if getattr(detection, "precise_crop", False):
+        bucket = "needs-review"
+    else:
+        bucket = "rejected" if score.bucket == "rejected" else "needs-review"
     out_name = _output_filename(src)
     # Face-based upright auto-rotation is disabled — it misfires too
     # often (flipping correctly-oriented photos 180°). The user can hit
@@ -292,6 +315,8 @@ def _process_one(args: tuple[str, str]) -> dict:
     # a raw version. Caching both means flipping the global Auto Tone
     # toggle reloads instantly without re-rendering any image.
     raw_cropped = result.cropped
+    if method == "negative":
+        raw_cropped = negative_to_positive(raw_cropped)
     final_cropped = auto_tone(raw_cropped)
     # Always write to the preview cache (used by the list view + editor).
     preview = preview_path_for(input_folder, src.name)
@@ -394,6 +419,7 @@ def apply_size_to_entry(
     )
     if cropped is None or cropped.size == 0:
         raise ValueError("crop produced empty image")
+    cropped = _positive(cropped, entry.detection_method)
     cropped = auto_tone(cropped)
 
     save_jpeg(preview_path_for(input_folder, filename), cropped, icc_profile=loaded.icc_profile)
@@ -410,11 +436,22 @@ def apply_size_to_entry(
     return entry
 
 
-def unify_slide_crops(input_folder: Path) -> int:
-    """Snap every slide-method entry to the median rect across all such
-    entries. Slides come off the same scanner at a consistent physical
-    position, so per-photo detection jitter is noise — averaging it out
-    gives identical crops across the whole batch.
+def unify_slide_crops(input_folder: Path, progress_callback=None) -> int:
+    return _unify_scanner_crops(input_folder, "slide", progress_callback)
+
+
+def unify_negative_crops(input_folder: Path, progress_callback=None) -> int:
+    return _unify_scanner_crops(input_folder, "negative", progress_callback)
+
+
+def _unify_scanner_crops(
+    input_folder: Path, method: str, progress_callback=None
+) -> int:
+    """Snap every entry from the given fixed-scanner method to the median
+    rect across all such entries. Slides and negatives both come off the
+    same scanner at a consistent physical position, so per-photo
+    detection jitter is noise — averaging it out gives identical crops
+    across the whole batch.
 
     Re-renders every affected entry's preview/thumb/cropped output.
     Returns the number of entries unified.
@@ -425,7 +462,7 @@ def unify_slide_crops(input_folder: Path) -> int:
     manifest = load_manifest(input_folder)
     candidates = [
         e for e in manifest.entries
-        if e.detection_method == "slide"
+        if e.detection_method == method
         and e.crop_box is not None
         and e.rotation_deg is not None
     ]
@@ -447,7 +484,13 @@ def unify_slide_crops(input_folder: Path) -> int:
     med_angle = float(np.median(angles))
 
     unified = 0
-    for entry in candidates:
+    total = len(candidates)
+    for idx, entry in enumerate(candidates, start=1):
+        if progress_callback is not None:
+            try:
+                progress_callback(idx, total, entry)
+            except Exception:
+                pass
         # Preserve each entry's portrait/landscape orientation.
         is_portrait = entry.crop_box.h > entry.crop_box.w
         w = med_short if is_portrait else med_long
@@ -462,7 +505,7 @@ def unify_slide_crops(input_folder: Path) -> int:
         )
         if cropped is None or cropped.size == 0:
             continue
-        raw_cropped = cropped
+        raw_cropped = _positive(cropped, method)
         toned_cropped = auto_tone(raw_cropped)
         save_jpeg(preview_path_for(input_folder, entry.filename), toned_cropped, icc_profile=loaded.icc_profile)
         save_jpeg(raw_preview_path_for(input_folder, entry.filename), raw_cropped, icc_profile=loaded.icc_profile)
@@ -476,6 +519,18 @@ def unify_slide_crops(input_folder: Path) -> int:
             save_jpeg(cropped_path_for(input_folder, entry.filename), visible, icc_profile=loaded.icc_profile)
         entry.crop_box = CropBoxModel(cx=med_cx, cy=med_cy, w=w, h=h)
         entry.rotation_deg = med_angle
+        # Keep the green detected-edge guide in sync with the unified
+        # crop_box; otherwise the editor draws the original per-entry
+        # detection which no longer matches the crop.
+        cv_rect = ((med_cx, med_cy), (w, h), med_angle)
+        box_pts = cv2.boxPoints(cv_rect)
+        centre = box_pts.mean(axis=0)
+        angles_pt = np.arctan2(box_pts[:, 1] - centre[1], box_pts[:, 0] - centre[0])
+        order = np.argsort(angles_pt)
+        sorted_pts = box_pts[order]
+        entry.detected_corners = [
+            {"x": float(p[0]), "y": float(p[1])} for p in sorted_pts
+        ]
         entry.timestamp = _now_iso()
         _prune_with_guide_cache(input_folder, entry.filename)
         unified += 1
@@ -554,6 +609,7 @@ def redetect_and_match_aspect(
     )
     if cropped is None or cropped.size == 0:
         raise ValueError("crop produced empty image")
+    cropped = _positive(cropped, entry.detection_method)
     cropped = auto_tone(cropped)
 
     save_jpeg(preview_path_for(input_folder, filename), cropped, icc_profile=loaded.icc_profile)
