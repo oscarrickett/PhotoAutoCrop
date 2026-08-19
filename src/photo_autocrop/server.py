@@ -34,7 +34,6 @@ from .pipeline import (
     save_manifest,
     run_batch,
     unify_slide_crops,
-    unify_negative_crops,
 )
 from .schemas import (
     CropBoxModel,
@@ -168,28 +167,23 @@ def _bg_pipeline(folder: Path, default_method: str = "auto") -> None:
                     default_method=default_method,
                     force_method=default_method,
                 )
-            if default_method in ("slide", "negative"):
+            if default_method == "slide":
                 def unify_cb(i: int, total: int, entry) -> None:
                     with _progress_lock:
                         _progress["done"] = i
                         _progress["total"] = total
                         _progress["current"] = entry.filename
-                label = (
-                    "Aligning slide crops" if default_method == "slide"
-                    else "Aligning negative crops"
-                )
                 with _progress_lock:
                     _progress["phase"] = "unifying"
-                    _progress["phase_label"] = label
+                    _progress["phase_label"] = "Aligning slide crops"
                     _progress["done"] = 0
                     _progress["total"] = 0
                     _progress["current"] = ""
                     _progress["started_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                unify_fn = (
-                    unify_slide_crops if default_method == "slide"
-                    else unify_negative_crops
-                )
-                unify_fn(folder, progress_callback=unify_cb)
+                unify_slide_crops(folder, progress_callback=unify_cb)
+            # Negatives: sprocket detection is precise per-image, so
+            # skip the median-alignment pass — it was smoothing away
+            # real, correct variation across frames.
     except Exception as exc:
         with _progress_lock:
             _progress["error"] = str(exc)
@@ -658,8 +652,6 @@ def reprocess(method: str = "auto") -> JSONResponse:
         unified = 0
         if method == "slide":
             unified = unify_slide_crops(folder)
-        elif method == "negative":
-            unified = unify_negative_crops(folder)
         return JSONResponse({
             "ok": True,
             "processed": len(to_process),

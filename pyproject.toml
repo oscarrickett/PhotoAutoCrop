@@ -1,6 +1,6 @@
 [project]
 name = "photo-autocrop"
-version = "0.6.0"
+version = "0.6.1"
 description = "Auto-crop and straighten copy-stand photos, with an in-browser review pass."
 requires-python = ">=3.10"
 dependencies = [

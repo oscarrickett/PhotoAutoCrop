@@ -531,31 +531,41 @@ def _detect_from_sprockets(small_bgr: np.ndarray) -> tuple[Rect | None, list[str
     if row_result is None and col_result is None:
         return None, ["no_sprocket_projection_peaks"]
 
-    landscape = row_strength >= col_strength
+    # Prefer landscape strongly: 35mm film strips are always long along
+    # one axis with sprockets on the two long edges. The col projection
+    # can spuriously peak on the bed→film-base brightness transitions,
+    # which are not sprocket rows. Only use portrait if row detection
+    # actually failed — not merely because col had louder peaks.
+    landscape = row_result is not None
 
     if landscape and row_result is not None:
         _, top_inner, bot_inner, _ = row_result
         image_top = float(top_inner)
         image_bottom = float(bot_inner)
-        # Left/right image edges: use col projection but look for the
-        # transition from bed (very dark) to film (bright), not
-        # sprocket peaks. The film's L is stable across the whole
-        # width until it drops off into the black bed.
-        bed_level = float(np.percentile(col_proj, 10))
-        film_level = float(np.median(col_proj))
-        thresh = (bed_level + film_level) / 2.0
-        left = 0
-        for i in range(len(col_proj)):
-            if col_proj[i] > thresh:
-                left = i
-                break
-        right = len(col_proj) - 1
-        for i in range(len(col_proj) - 1, -1, -1):
-            if col_proj[i] > thresh:
-                right = i
-                break
-        image_left = float(left)
-        image_right = float(right)
+        # Left/right image edges: prefer col peaks (the sharp bed→film
+        # transitions themselves) if they're detectable — those land
+        # exactly on the film boundary. Fall back to a bed/film midpoint
+        # crossing if peaks aren't distinct enough.
+        if col_result is not None:
+            col_peak_left, _, _, col_peak_right = col_result
+            image_left = float(col_peak_left)
+            image_right = float(col_peak_right)
+        else:
+            bed_level = float(np.percentile(col_proj, 10))
+            film_level = float(np.median(col_proj))
+            thresh = (bed_level + film_level) / 2.0
+            left = 0
+            for i in range(len(col_proj)):
+                if col_proj[i] > thresh:
+                    left = i
+                    break
+            right = len(col_proj) - 1
+            for i in range(len(col_proj) - 1, -1, -1):
+                if col_proj[i] > thresh:
+                    right = i
+                    break
+            image_left = float(left)
+            image_right = float(right)
     elif col_result is not None:
         _, left_inner, right_inner, _ = col_result
         image_left = float(left_inner)
