@@ -33,9 +33,12 @@
     $("#list-view").hidden = name !== "list";
     $("#editor-view").hidden = name !== "editor";
     $("#topbar").hidden = name === "folder";
-    // The review-progress bar belongs to the list view only. renderCounts
-    // will re-show it (if there are entries) the next time it runs.
-    if (name !== "list") $("#review-progress").hidden = true;
+    state.view = name;
+    // Progress bar shows in list + editor (so Save & Next keeps you
+    // oriented). Hidden only during the folder picker. renderCounts is
+    // what actually decides visibility based on entry counts.
+    if (name === "folder") $("#review-progress").hidden = true;
+    else renderCounts();
   }
 
   // ---------- Folder picker ----------
@@ -246,7 +249,15 @@
       } else if (total > 0) {
         const pct = Math.round((counts.approved / total) * 100);
         fill.style.width = pct + "%";
-        label.textContent = `${counts.approved} / ${total} (${pct}%)`;
+        // In the editor, prepend the current photo's position in the
+        // active filter so Save & Next has a "you are here" indicator.
+        let labelText = `${counts.approved} / ${total} saved (${pct}%)`;
+        if (state.view === "editor" && state.current) {
+          const list = filteredEntries();
+          const idx = list.findIndex((e) => e.filename === state.current.filename);
+          if (idx >= 0) labelText = `Photo ${idx + 1} of ${list.length} · ` + labelText;
+        }
+        label.textContent = labelText;
         bar.hidden = false;
       } else {
         bar.hidden = true;
@@ -609,11 +620,27 @@
     img.onload = () => {
       state.imageEl = img;
       requestAnimationFrame(() => requestAnimationFrame(setupKonva));
+      // Warm the browser cache with the next photo's full-res image while
+      // the user reviews this one, so Save & Next opens instantly.
+      prefetchNextImage(entry.filename);
     };
     img.onerror = () => {
       toast(`Image failed to load: ${entry.filename}`, 4000);
     };
     img.src = `/api/image/${encodeURIComponent(entry.filename)}`;
+  }
+
+  function prefetchNextImage(currentFilename) {
+    const list = filteredEntries();
+    const idx = list.findIndex((e) => e.filename === currentFilename);
+    if (idx < 0 || idx + 1 >= list.length) return;
+    const next = list[idx + 1];
+    if (!next || !next.filename) return;
+    // Plain Image() request; the browser HTTP cache serves it when
+    // openEditor later hits the same URL. No cache-buster: the URL must
+    // match the one openEditor uses.
+    const pre = new Image();
+    pre.src = `/api/image/${encodeURIComponent(next.filename)}`;
   }
 
   function editorHasUnsavedEdits() {
@@ -689,9 +716,15 @@
     }
     const img = state.imageEl;
     if (!img) return;
-    const fit = Math.min(W / img.width, H / img.height);
-    const displayW = img.width * fit;
-    const displayH = img.height * fit;
+    // Use source-image pixel dimensions when available. The server may
+    // serve a downscaled display copy for perf, but crop-box coordinates
+    // are always in source-pixel space — so `fit` (display-per-source-
+    // pixel) must be measured against source dims, not img dims.
+    const srcW = state.current?.source_width || img.width;
+    const srcH = state.current?.source_height || img.height;
+    const fit = Math.min(W / srcW, H / srcH);
+    const displayW = srcW * fit;
+    const displayH = srcH * fit;
 
     const stage = new Konva.Stage({ container, width: W, height: H });
     const imageLayer = new Konva.Layer();
@@ -745,8 +778,8 @@
       w = Math.max(side01, side12);
       h = Math.min(side01, side12);
     } else {
-      cx = img.width / 2; cy = img.height / 2;
-      w = img.width * 0.8; h = img.height * 0.8;
+      cx = srcW / 2; cy = srcH / 2;
+      w = srcW * 0.8; h = srcH * 0.8;
     }
     const cropRect = new Konva.Rect({
       x: cx * fit, y: cy * fit,
@@ -891,80 +924,96 @@
     return { cx: local_x / k.fit, cy: local_y / k.fit, w: w / k.fit, h: h / k.fit };
   }
 
+  function captureSaveArgs(decision) {
+    if (!state.current) return null;
+    const crop = getCropBoxInImageCoords();
+    if (!crop) return null;
+    return {
+      filename: state.current.filename,
+      rotation_deg: parseFloat($("#rotation-slider").value),
+      crop_box: crop,
+      decision,
+      upright_rotation_qt: state.uprightQt || 0,
+    };
+  }
+
+  // Optimistically patch the local manifest entry so the UI can move on
+  // before the server responds. Returns the pre-patch snapshot for revert.
+  function patchLocalEntry(args) {
+    const entry = state.manifest?.entries?.find((e) => e.filename === args.filename);
+    if (!entry) return null;
+    const prev = { ...entry, crop_box: entry.crop_box ? { ...entry.crop_box } : null };
+    entry.decision = args.decision;
+    entry.rotation_deg = args.rotation_deg;
+    entry.crop_box = args.crop_box;
+    entry.upright_rotation_qt = args.upright_rotation_qt;
+    entry.edited_by_user = true;
+    entry.timestamp = new Date().toISOString();
+    return prev;
+  }
+
+  function revertLocalEntry(prev) {
+    if (!prev) return;
+    const entry = state.manifest?.entries?.find((e) => e.filename === prev.filename);
+    if (!entry) return;
+    Object.assign(entry, prev);
+  }
+
+  // Fire the POST in the background. On success: refresh the row image
+  // (so the freshly-written crop replaces any stale thumbnail). On
+  // failure: revert the optimistic patch and toast an error.
+  function submitSaveInBackground(args, prevSnapshot) {
+    fetch("/api/save-edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(args),
+    })
+      .then((r) => {
+        if (!r.ok) throw new Error("save failed");
+        state.cacheBuster = Date.now();
+        const entry = state.manifest?.entries?.find((e) => e.filename === args.filename);
+        if (entry) applyEntryUpdate(entry);
+      })
+      .catch((err) => {
+        console.error(err);
+        revertLocalEntry(prevSnapshot);
+        renderCounts();
+        const entry = state.manifest?.entries?.find((e) => e.filename === args.filename);
+        if (entry) applyEntryUpdate(entry);
+        toast(`Save failed: ${args.filename}`, 4000);
+      });
+  }
+
   async function saveDecisionAndNext(decision) {
-    // Snapshot the ordered filtered list BEFORE saving so we know which
-    // entry to open next even if the just-saved one moves out of the
-    // current filter.
+    const args = captureSaveArgs(decision);
+    if (!args) return;
+    // Snapshot filtered order BEFORE the optimistic patch so we correctly
+    // identify "the next photo" even when the just-saved one moves out.
     const before = filteredEntries();
-    const currentName = state.current?.filename;
-    const idx = currentName ? before.findIndex((e) => e.filename === currentName) : -1;
+    const idx = before.findIndex((e) => e.filename === args.filename);
     const nextName = idx >= 0 && idx + 1 < before.length ? before[idx + 1].filename : null;
-    await saveDecision(decision);
-    // saveDecision already refetched the manifest and closed the editor.
-    // Open the next entry — prefer the one that was originally next; if
-    // the saved entry left the filter, the same index now points at it.
+    const prev = patchLocalEntry(args);
+    submitSaveInBackground(args, prev);
+    renderCounts();
     const after = filteredEntries();
     let candidate = null;
     if (nextName) candidate = after.find((e) => e.filename === nextName);
     if (!candidate && idx >= 0 && idx < after.length) candidate = after[idx];
+    closeEditor();
     if (candidate) openEditor(candidate);
     else toast("No more photos in this filter");
   }
 
   async function saveDecision(decision) {
-    if (!state.current) return;
-    const rotation = parseFloat($("#rotation-slider").value);
-    const crop = getCropBoxInImageCoords();
-    if (!crop) return;
-    // Visual feedback during the save round-trip (server re-renders the
-    // full-res crop + writes JPEG + updates the manifest — easily 1–2s).
-    const btn = $("#btn-approve");
-    const originalLabel = btn.textContent;
-    btn.disabled = true;
-    btn.classList.add("saving");
-    btn.innerHTML = '<span class="btn-spinner"></span> Saving…';
-    const restore = () => {
-      btn.disabled = false;
-      btn.classList.remove("saving");
-      btn.textContent = originalLabel;
-    };
-    try {
-      const r = await fetch("/api/save-edit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          filename: state.current.filename,
-          rotation_deg: rotation,
-          crop_box: crop,
-          decision,
-          upright_rotation_qt: state.uprightQt || 0,
-        }),
-      });
-      if (!r.ok) {
-        toast("Save failed");
-        return;
-      }
-      toast("Saved");
-      // Bust browser image caches so the row reloads the freshly-written
-      // crop instead of any leftover toned/untoned URL from before.
-      state.cacheBuster = Date.now();
-      const savedFilename = state.current.filename;
-      await fetchManifest();
-      renderCounts();
-      closeEditor();
-      // Apply the targeted update (animate-out if it no longer matches the
-      // active filter; otherwise refresh in place). Done after closeEditor
-      // so the user sees the list with the saved row sliding away.
-      const entry = state.manifest.entries.find((e) => e.filename === savedFilename);
-      if (entry) applyEntryUpdate(entry);
-    } catch (err) {
-      console.error(err);
-      toast("Save failed");
-    } finally {
-      // Always restore the button — otherwise it stays stuck in "Saving…"
-      // for the next photo the user opens.
-      restore();
-    }
+    const args = captureSaveArgs(decision);
+    if (!args) return;
+    const prev = patchLocalEntry(args);
+    submitSaveInBackground(args, prev);
+    toast("Saved");
+    renderCounts();
+    closeEditor();
+    const entry = state.manifest?.entries?.find((e) => e.filename === args.filename);
+    if (entry) applyEntryUpdate(entry);
   }
 
   // ---------- Re-run detection from the editor ----------
@@ -1198,8 +1247,8 @@
       else if (e.key === "s" || e.key === "S") saveDecision("approved");
       else if (e.key === "n" || e.key === "N") saveDecisionAndNext("approved");
       else if (e.key === "Enter") saveDecision("approved");
-      else if (e.key === "ArrowLeft") { nudgeRotation(e.shiftKey ? -0.1 : -0.5); e.preventDefault(); }
-      else if (e.key === "ArrowRight") { nudgeRotation(e.shiftKey ? 0.1 : 0.5); e.preventDefault(); }
+      else if (e.key === "ArrowLeft") { nudgeRotation(e.shiftKey ? -0.5 : -0.1); e.preventDefault(); }
+      else if (e.key === "ArrowRight") { nudgeRotation(e.shiftKey ? 0.5 : 0.1); e.preventDefault(); }
     });
 
     window.addEventListener("resize", () => {

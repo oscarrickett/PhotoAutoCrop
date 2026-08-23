@@ -65,6 +65,9 @@ def main() -> None:
         "--collect-submodules", "starlette",
         "--collect-submodules", "anyio",
         "--collect-submodules", "photo_autocrop",
+        # importlib.metadata.version() needs the .dist-info bundled or
+        # __version__ falls back to "0.0.0+source" in the frozen exe.
+        "--copy-metadata", "photo-autocrop",
         "--noconfirm",
         "--clean",
     ]

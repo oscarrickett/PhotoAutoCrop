@@ -318,7 +318,29 @@ def set_entry_auto_tone(filename: str, on: bool = True) -> JSONResponse:
 
 @app.get("/api/manifest")
 def get_manifest() -> JSONResponse:
-    m = load_manifest(_folder())
+    folder = _folder()
+    m = load_manifest(folder)
+    # Backfill source dims for any entry the pipeline never populated
+    # them for (older folders). Reads JPEG headers only via Pillow —
+    # cheap even on 50 MP scans.
+    dirty = False
+    for e in m.entries:
+        if e.source_width and e.source_height:
+            continue
+        src = folder / e.filename
+        if not src.exists():
+            continue
+        try:
+            from PIL import Image as _PILImage
+            with _PILImage.open(src) as im:
+                w, h = im.size
+            e.source_width = int(w)
+            e.source_height = int(h)
+            dirty = True
+        except Exception:
+            pass
+    if dirty:
+        save_manifest(folder, m)
     return JSONResponse(m.model_dump(mode="json"))
 
 
@@ -327,35 +349,72 @@ def get_original(filename: str) -> FileResponse:
     p = _input_path(filename)
     if not p.exists():
         raise HTTPException(status_code=404, detail="original not found")
-    positive = _positive_original_path(filename)
-    if positive is not None:
-        return FileResponse(positive, media_type="image/jpeg")
+    display = _display_original_path(filename)
+    if display is not None:
+        return FileResponse(display, media_type="image/jpeg")
     return FileResponse(p, media_type="image/jpeg")
 
 
-def _positive_original_path(filename: str) -> Path | None:
-    """For negative-method entries, return a disk-cached path to the
-    original scan inverted to positive. First call generates and caches
-    the file; subsequent calls hit the cache. Returns None for
-    non-negative entries so the raw JPG is served as-is.
+def _display_original_path(filename: str) -> Path | None:
+    """Editor-view version of the original scan, cached on disk.
+
+    - Negative-method entries: invert + auto_tone (so the negative shows
+      as a positive with balanced colours).
+    - Other entries with Auto Tone on: apply auto_tone (so the user sees
+      the same colour correction that the saved crop will get).
+    - Auto Tone off on a non-negative: return None → the raw file is
+      served as-is.
+
+    The stem-suffix on the cache path lets both variants coexist without
+    stepping on each other, and lets us bust one without touching the
+    other.
     """
     entry = _entry_for(filename)
-    if entry is None or entry.detection_method != "negative":
+    if entry is None:
         return None
     folder = _folder()
     src = _input_path(filename)
-    cache_dir = folder / CACHE_DIRNAME / "positive_original"
+    is_negative = entry.detection_method == "negative"
+    auto_tone_on = bool(getattr(entry, "auto_tone", True))
+    if not is_negative and not auto_tone_on:
+        return None
+
+    # Bump the subdir suffix when the display pipeline changes so stale
+    # caches from old builds don't get served after an algorithm update.
+    # The `_disp` suffix marks the downscaled editor-preview variant.
+    subdir = "positive_original_v3_disp" if is_negative else "toned_original_v2_disp"
+    cache_dir = folder / CACHE_DIRNAME / subdir
     cache_path = cache_dir / f"{Path(filename).stem}.jpg"
     if cache_path.exists() and cache_path.stat().st_mtime >= src.stat().st_mtime:
         return cache_path
-    from .negative import negative_to_positive
+
+    # Downscale for editor preview — canvas is at most ~2000px wide.
+    # Running the whole pipeline at 44 MP on modern scans is a ~8s round
+    # trip; a 2400px long edge drops it to well under a second while
+    # staying sharp on-screen.
     from .auto_tone import auto_tone as _auto_tone
     loaded = load_image(src)
-    positive = negative_to_positive(loaded.bgr)
-    positive = _auto_tone(positive)
+    bgr = _downscale_for_display(loaded.bgr, max_edge=2400)
+    if is_negative:
+        from .negative import gray_world_balance, negative_to_positive
+        bgr = negative_to_positive(bgr)
+    bgr = _auto_tone(bgr)
+    if is_negative:
+        bgr = gray_world_balance(bgr)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    save_jpeg(cache_path, positive, icc_profile=loaded.icc_profile)
+    save_jpeg(cache_path, bgr, icc_profile=loaded.icc_profile)
     return cache_path
+
+
+def _downscale_for_display(bgr: np.ndarray, max_edge: int) -> np.ndarray:
+    h, w = bgr.shape[:2]
+    longest = max(h, w)
+    if longest <= max_edge:
+        return bgr
+    scale = max_edge / float(longest)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    return cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 @app.get("/api/output/{filename}")
@@ -423,7 +482,7 @@ def get_original_with_guide(filename: str, max_edge: int = 600) -> Response:
     # For negatives, render the guide over the inverted positive so the
     # editor thumbnail and the "with guide" strip in the list view both
     # show something recognisable instead of a pink negative.
-    positive_src = _positive_original_path(filename)
+    positive_src = _display_original_path(filename)
     read_from = str(positive_src) if positive_src is not None else str(src)
     bgr = cv2.imread(read_from, cv2.IMREAD_COLOR)
     if bgr is None:
@@ -492,16 +551,52 @@ def save_edit(req: SaveEditRequest) -> JSONResponse:
     else:
         upright_qt = 0
 
+    # Fast path: if the user didn't touch rotation/crop/upright vs. the
+    # manifest, the already-rendered preview is the correct output — just
+    # copy it into cropped/ (like save-all does) and update the manifest.
+    # Same tolerances the client uses in editorHasUnsavedEdits().
+    if existing is not None and existing.crop_box is not None:
+        eb = existing.crop_box
+        rot_same = abs((existing.rotation_deg or 0) - req.rotation_deg) <= 0.01
+        crop_same = (
+            abs(eb.cx - req.crop_box.cx) <= 0.5
+            and abs(eb.cy - req.crop_box.cy) <= 0.5
+            and abs(eb.w - req.crop_box.w) <= 0.5
+            and abs(eb.h - req.crop_box.h) <= 0.5
+        )
+        upright_same = int(existing.upright_rotation_qt) % 4 == upright_qt
+        preview_src = (
+            preview_path_for(folder, req.filename)
+            if getattr(existing, "auto_tone", True)
+            else raw_preview_path_for(folder, req.filename)
+        )
+        if rot_same and crop_same and upright_same and preview_src.exists():
+            if req.decision == "approved":
+                target = cropped_path_for(folder, req.filename)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                import shutil
+                shutil.copyfile(preview_src, target)
+            else:
+                remove_cropped_if_present(folder, req.filename)
+            existing.decision = req.decision
+            existing.edited_by_user = True
+            existing.timestamp = _now()
+            save_manifest(folder, manifest)
+            return JSONResponse({"ok": True, "decision": req.decision, "fast_path": True})
+
     loaded = load_image(original)
     box = CropBox(cx=req.crop_box.cx, cy=req.crop_box.cy, w=req.crop_box.w, h=req.crop_box.h)
     raw_cropped = apply_user_edit(loaded.bgr, req.rotation_deg, box, upright_qt=upright_qt)
     if raw_cropped is None or raw_cropped.size == 0:
         raise HTTPException(status_code=400, detail="crop produced empty image")
-    if existing is not None and existing.detection_method == "negative":
-        from .negative import negative_to_positive
+    is_neg = existing is not None and existing.detection_method == "negative"
+    if is_neg:
+        from .negative import gray_world_balance, negative_to_positive
         raw_cropped = negative_to_positive(raw_cropped)
     from .auto_tone import auto_tone as _auto_tone
     toned_cropped = _auto_tone(raw_cropped)
+    if is_neg:
+        toned_cropped = gray_world_balance(toned_cropped)
     # Per-photo Auto Tone — preserves the previous choice; defaults to on
     # for brand-new entries.
     auto_tone_on = bool(existing.auto_tone) if existing is not None else True
@@ -704,12 +799,15 @@ def rotate_upright(req: RotateUprightRequest) -> JSONResponse:
     cropped = apply_user_edit(loaded.bgr, entry.rotation_deg, box, upright_qt=new_qt)
     if cropped is None or cropped.size == 0:
         raise HTTPException(status_code=400, detail="crop produced empty image")
-    if entry.detection_method == "negative":
-        from .negative import negative_to_positive
+    is_neg = entry.detection_method == "negative"
+    if is_neg:
+        from .negative import gray_world_balance, negative_to_positive
         cropped = negative_to_positive(cropped)
     from .auto_tone import auto_tone as _auto_tone
     raw_cropped = cropped
     toned_cropped = _auto_tone(raw_cropped)
+    if is_neg:
+        toned_cropped = gray_world_balance(toned_cropped)
     auto_tone_on = bool(entry.auto_tone)
     save_jpeg(preview_path_for(folder, req.filename), toned_cropped, icc_profile=loaded.icc_profile)
     save_jpeg(raw_preview_path_for(folder, req.filename), raw_cropped, icc_profile=loaded.icc_profile)

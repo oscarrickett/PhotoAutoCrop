@@ -42,3 +42,29 @@ def negative_to_positive(bgr: np.ndarray) -> np.ndarray:
         rescaled = (channel - black) * (255.0 / span)
         out[..., c] = rescaled
     return np.clip(out, 0.0, 255.0).astype(np.uint8)
+
+
+def gray_world_balance(bgr: np.ndarray, strength: float = 1.0) -> np.ndarray:
+    """Scale each channel toward a shared mean.
+
+    Removes the uniform-midtone colour cast that per-channel percentile
+    stretching (``auto_tone``) leaves behind on scanned negatives. Meant
+    to run after ``auto_tone`` so the extremes are already snapped.
+    """
+    if bgr.dtype != np.uint8:
+        return bgr
+    strength = float(max(0.0, min(1.0, strength)))
+    if strength == 0.0:
+        return bgr
+    f = bgr.astype(np.float32)
+    means = np.array([f[..., c].mean() for c in range(3)], dtype=np.float32)
+    target = float(means.mean())
+    out = np.empty_like(f)
+    for c in range(3):
+        m = means[c]
+        if m < 1.0:
+            out[..., c] = f[..., c]
+            continue
+        scale = 1.0 + (target / m - 1.0) * strength
+        out[..., c] = f[..., c] * scale
+    return np.clip(out, 0.0, 255.0).astype(np.uint8)

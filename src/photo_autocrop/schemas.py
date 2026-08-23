@@ -51,6 +51,11 @@ class ManifestEntry(BaseModel):
     error: Optional[str] = None
     edited_by_user: bool = False
     timestamp: str
+    # Source-image pixel dimensions. Populated lazily by the server on
+    # first manifest read; needed so the editor can render a downscaled
+    # display copy while keeping crop-box coords in source-pixel space.
+    source_width: Optional[int] = None
+    source_height: Optional[int] = None
 
 
 class Manifest(BaseModel):

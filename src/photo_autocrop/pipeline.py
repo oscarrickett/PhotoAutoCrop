@@ -21,7 +21,7 @@ from .io_utils import (
     save_thumbnail,
 )
 from .auto_tone import auto_tone
-from .negative import negative_to_positive
+from .negative import gray_world_balance, negative_to_positive
 from .orient import detect_upright_quarter_turns
 from .schemas import CropBoxModel, Manifest, ManifestEntry
 from .score import score_detection
@@ -318,6 +318,8 @@ def _process_one(args: tuple[str, str]) -> dict:
     if method == "negative":
         raw_cropped = negative_to_positive(raw_cropped)
     final_cropped = auto_tone(raw_cropped)
+    if method == "negative":
+        final_cropped = gray_world_balance(final_cropped)
     # Always write to the preview cache (used by the list view + editor).
     preview = preview_path_for(input_folder, src.name)
     save_jpeg(preview, final_cropped, icc_profile=loaded.icc_profile)
