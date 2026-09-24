@@ -82,8 +82,10 @@ Optional. Without it, SmartScreen may show a warning on first run that the user 
 | Key | Action |
 |---|---|
 | `S` or `Enter` | Save the current crop |
-| `Esc` | Back to the list without saving |
-| `←` / `→` | Rotate ±0.5° (hold `Shift` for ±0.1°) |
+| `N` | Save and open the next photo |
+| `V` | Copy crop + rotation from the previous photo in the list |
+| `Esc` | Back to the list (keeps unsaved tweaks) |
+| `←` / `→` | Rotate ±0.1° (hold `Shift` for ±0.5°) |
 
 ## Folder layout
 

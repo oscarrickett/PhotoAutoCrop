@@ -75,7 +75,7 @@
       <button id="btn-back">&larr; Back to list</button>
       <div class="editor-filename" id="editor-filename"></div>
       <div class="editor-shortcuts">
-        <kbd>S</kbd> save &nbsp; <kbd>N</kbd> save &amp; next &nbsp; <kbd>Esc</kbd> cancel &nbsp;
+        <kbd>S</kbd> save &nbsp; <kbd>N</kbd> save &amp; next &nbsp; <kbd>V</kbd> crop from previous &nbsp; <kbd>Esc</kbd> cancel &nbsp;
         <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> rotate &nbsp; <kbd>Shift</kbd> coarser
       </div>
     </header>
@@ -110,6 +110,9 @@
         <div class="ctl-buttons">
           <button id="btn-reset">Reset to auto</button>
           <button id="btn-fit-frame">Fit to frame</button>
+        </div>
+        <div class="ctl-buttons">
+          <button id="btn-paste-prev" title="Copy the crop box, rotation and 90° turns from the photo before this one in the list">Same crop as previous (V)</button>
         </div>
         <div class="ctl-buttons">
           <button id="btn-redetect-slide" title="Re-detect this photo as a scanned slide (finds the bright image inside the dark mount)">Re-detect as slide</button>

@@ -924,6 +924,43 @@
     return { cx: local_x / k.fit, cy: local_y / k.fit, w: w / k.fit, h: h / k.fit };
   }
 
+  // Copy the previous photo's crop + rotation onto the current one. "Previous"
+  // is the entry just before this one in manifest order (i.e. folder order),
+  // NOT the filtered list — during a Save & Next run the photo you just saved
+  // leaves the Needs-review filter, but it's still the natural paste source.
+  // Coordinates are absolute source pixels, so this lands exactly right when
+  // scans share dimensions (a slide tray) and needs only a nudge otherwise.
+  function pasteCropFromPrevious() {
+    if (!state.current || !state.konva) return;
+    const entries = state.manifest?.entries ?? [];
+    const idx = entries.findIndex((e) => e.filename === state.current.filename);
+    if (idx <= 0) {
+      toast("This is the first photo — nothing before it to copy from");
+      return;
+    }
+    const src = entries[idx - 1];
+    if (!src.crop_box) {
+      toast(`${src.filename} has no crop to copy`);
+      return;
+    }
+    state.uprightQt = ((src.upright_rotation_qt ?? 0) % 4 + 4) % 4;
+    setRotation(src.rotation_deg ?? 0);
+    const k = state.konva;
+    const cb = src.crop_box;
+    k.cropRect.width(cb.w * k.fit);
+    k.cropRect.height(cb.h * k.fit);
+    k.cropRect.offsetX((cb.w * k.fit) / 2);
+    k.cropRect.offsetY((cb.h * k.fit) / 2);
+    k.cropRect.x(cb.cx * k.fit);
+    k.cropRect.y(cb.cy * k.fit);
+    k.cropRect.scaleX(1);
+    k.cropRect.scaleY(1);
+    if (k.transformer) k.transformer.forceUpdate();
+    k.imageLayer.batchDraw();
+    k.overlayLayer.batchDraw();
+    toast(`Crop copied from ${src.filename}`);
+  }
+
   function captureSaveArgs(decision) {
     if (!state.current) return null;
     const crop = getCropBoxInImageCoords();
@@ -1236,6 +1273,7 @@
       k.imageLayer.batchDraw();
       k.overlayLayer.batchDraw();
     });
+    $("#btn-paste-prev").addEventListener("click", pasteCropFromPrevious);
     $("#btn-approve").addEventListener("click", () => saveDecision("approved"));
     $("#btn-approve-next").addEventListener("click", () => saveDecisionAndNext("approved"));
     $("#btn-reset-rotation").addEventListener("click", () => setRotation(0));
@@ -1247,6 +1285,7 @@
       else if (e.key === "s" || e.key === "S") saveDecision("approved");
       else if (e.key === "n" || e.key === "N") saveDecisionAndNext("approved");
       else if (e.key === "Enter") saveDecision("approved");
+      else if ((e.key === "v" || e.key === "V") && !e.ctrlKey && !e.metaKey) pasteCropFromPrevious();
       else if (e.key === "ArrowLeft") { nudgeRotation(e.shiftKey ? -0.5 : -0.1); e.preventDefault(); }
       else if (e.key === "ArrowRight") { nudgeRotation(e.shiftKey ? 0.5 : 0.1); e.preventDefault(); }
     });
